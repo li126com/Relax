@@ -68,7 +68,7 @@ def test_grpo_advantages_is_a_distinct_list_from_returns():
     assert not torch.equal(ret[0], adv[0])
 
 
-@pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo"])
+@pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo", "m2po", "rloo"])
 def test_grpo_family_produces_identical_advantages(estimator):
     baseline, _ = compute_advantages_and_returns(_args("grpo"), rewards=[0.5, -0.5], **_inputs())
     actual, _ = compute_advantages_and_returns(_args(estimator), rewards=[0.5, -0.5], **_inputs())

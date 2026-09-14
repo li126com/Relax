@@ -26,7 +26,6 @@ from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
     compute_gspo_kl,
-    compute_m2po_loss,
     compute_opsm_mask,
 )
 from relax.utils.types import RolloutBatch
@@ -940,7 +939,17 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    pg_loss, pg_clipfrac = compute_policy_loss_for(args, log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
+    pg_loss, pg_clipfrac, policy_scalar_metrics = compute_policy_loss_for(
+        args,
+        log_probs=log_probs,
+        ppo_kl=ppo_kl,
+        advantages=advantages,
+        loss_masks=batch["loss_masks"],
+    )
+    policy_scalar_metrics = {
+        name: sum_of_sample_mean(value.expand_as(ppo_kl)).clone().detach()
+        for name, value in policy_scalar_metrics.items()
+    }
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -1119,11 +1128,10 @@ def policy_loss_function(
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
 
-    if args.advantage_estimator == "m2po":
-        reported_loss["ppo_kl_m2_before"] = torch.tensor(_m2_now, device=ppo_kl.device).detach()
-        reported_loss["ppo_kl_m2_after"] = torch.tensor(_m2_after, device=ppo_kl.device).detach()
-        reported_loss["m2po_eps_low"] = torch.tensor(_eps_low, device=ppo_kl.device).detach()
-        reported_loss["m2po_eps_high"] = torch.tensor(_eps_high, device=ppo_kl.device).detach()
+    duplicate_policy_metrics = reported_loss.keys() & policy_scalar_metrics.keys()
+    if duplicate_policy_metrics:
+        raise ValueError(f"Policy scalar metrics would overwrite existing metrics: {sorted(duplicate_policy_metrics)}")
+    reported_loss.update(policy_scalar_metrics)
 
     return loss, reported_loss
 
@@ -1486,13 +1494,6 @@ def loss_function(
         )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
-
-    # M2PO scalar metrics are global (not per-token). When calculate_per_token_loss=True
-    # the framework divides all log values by num_tokens, so pre-multiply to cancel.
-    if args.calculate_per_token_loss and getattr(args, "advantage_estimator", None) == "m2po":
-        for key in ("ppo_kl_m2_before", "ppo_kl_m2_after", "m2po_eps_low", "m2po_eps_high"):
-            if key in log:
-                log[key] = log[key] * num_tokens
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding or all-masked). Without this, gradient doesn't flow through their attention

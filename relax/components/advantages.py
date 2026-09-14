@@ -118,8 +118,8 @@ class Advantages(Base):
         `self.config.advantage_estimator`.
 
         This function extracts rewards, log-probs, values, and masks from
-        `rollout_data`, computes KL divergences, then delegates to the estimator
-        the algorithm registry names for `self.config.advantage_estimator`
+        `rollout_data`, computes KL divergences, then delegates to the advantage
+        implementation named by the registry for `self.config.advantage_estimator`
         (see `relax.algorithms.advantages.ADVANTAGE_FNS`).
 
         Early returns if both `log_probs` and `values` are None (intermediate

@@ -47,6 +47,24 @@ class AlgorithmSpec:
     policy_loss_fn: str
     """Key into :data:`relax.algorithms.policy.POLICY_LOSS_FNS`."""
 
+    requires_complete_reward_groups: bool = False
+    """Whether rollout/debug batching must preserve whole prompt groups.
+
+    This is explicit rather than inferred from ``reward_normalizer != "none"``:
+    a future sample- or batch-scoped normalizer must not accidentally trigger
+    group-aware subsampling merely because it performs some normalization.
+    """
+
+    policy_scalar_metric_names: tuple[str, ...] = ()
+    """Names for scalar diagnostics returned after loss and clip fraction.
+
+    Policy adapters return these values in the same order. The policy caller
+    rejects complex values, normalizes real scalars to float32, broadcasts them
+    over the local response tokens, and applies the standard loss reducer. Thus
+    sample-mean and per-token logging both receive the numerator expected by
+    their generic denominator.
+    """
+
     kl_level: str = "token"
     """``"token"`` or ``"sequence"``; GSPO constrains the sequence as a whole."""
 
@@ -67,6 +85,9 @@ class AlgorithmSpec:
 
     needs_full_log_probs: bool = False
     """Whether the loss needs CP-gathered full-response log probs."""
+
+    supports_context_parallel: bool = True
+    """Whether the policy kernel is correct when a response is CP-sharded."""
 
     # --- orchestration and validation ---
     needs_critic: bool = False
@@ -154,11 +175,15 @@ class AlgorithmSpec:
                     f"Expected one of {sorted(allowed)}."
                 )
 
+        if any(not name for name in self.policy_scalar_metric_names):
+            raise ValueError(f"AlgorithmSpec({self.name!r}) has an empty policy scalar metric name.")
+        if len(set(self.policy_scalar_metric_names)) != len(self.policy_scalar_metric_names):
+            raise ValueError(f"AlgorithmSpec({self.name!r}) has duplicate policy scalar metric names.")
+
     @property
     def is_group_normalized(self) -> bool:
-        """Whether rewards get normalised per prompt group on the rollout
-        side."""
-        return self.reward_normalizer != "none"
+        """Backward-compatible alias for group-aware batching consumers."""
+        return self.requires_complete_reward_groups
 
 
 # NOTE(dev): explicit dict literal, deliberately not decorator-based registration.
@@ -169,12 +194,14 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
     "grpo": AlgorithmSpec(
         name="grpo",
         reward_normalizer="group_mean_std",
+        requires_complete_reward_groups=True,
         advantage_fn="grpo_broadcast",
         policy_loss_fn="ppo_clip",
     ),
     "gspo": AlgorithmSpec(
         name="gspo",
         reward_normalizer="group_mean_std",
+        requires_complete_reward_groups=True,
         advantage_fn="grpo_broadcast",
         policy_loss_fn="ppo_clip",
         kl_level="sequence",
@@ -183,14 +210,33 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
     "sapo": AlgorithmSpec(
         name="sapo",
         reward_normalizer="group_mean_std",
+        requires_complete_reward_groups=True,
         advantage_fn="grpo_broadcast",
         policy_loss_fn="sapo",
     ),
     "cispo": AlgorithmSpec(
         name="cispo",
         reward_normalizer="group_mean_std",
+        requires_complete_reward_groups=True,
         advantage_fn="grpo_broadcast",
         policy_loss_fn="cispo",
+    ),
+    "m2po": AlgorithmSpec(
+        name="m2po",
+        # M2PO replaces GRPO's fixed policy clip, not its group-relative
+        # reward advantage. Main omitted this name from its old whitelist;
+        # declaring the intended normalizer here fixes that integration gap.
+        reward_normalizer="group_mean_std",
+        requires_complete_reward_groups=True,
+        advantage_fn="grpo_broadcast",
+        policy_loss_fn="m2po",
+        supports_context_parallel=False,
+        policy_scalar_metric_names=(
+            "ppo_kl_m2_before",
+            "ppo_kl_m2_after",
+            "m2po_eps_low",
+            "m2po_eps_high",
+        ),
     ),
     "rloo": AlgorithmSpec(
         name="rloo",
@@ -199,6 +245,7 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
         # differs from GRPO's while the advantage stage -- broadcast the scalar
         # over the response tokens -- is the same one.
         reward_normalizer="group_leave_one_out",
+        requires_complete_reward_groups=True,
         advantage_fn="grpo_broadcast",
         policy_loss_fn="rloo",
         requires_rewards_normalization=True,
@@ -221,14 +268,17 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
         reward_normalizer="none",
         advantage_fn="reinforce_plus_plus",
         policy_loss_fn="ppo_clip",
+        supports_context_parallel=False,
         requires_normalize_advantages=True,
     ),
     "reinforce_plus_plus_baseline": AlgorithmSpec(
         name="reinforce_plus_plus_baseline",
         advantage_normalization="token_global",
         reward_normalizer="group_mean",
+        requires_complete_reward_groups=True,
         advantage_fn="reinforce_plus_plus_baseline",
         policy_loss_fn="ppo_clip",
+        supports_context_parallel=False,
         requires_normalize_advantages=True,
         # `_validate_reinforce_plus_plus_args` in `relax/utils/arguments.py`
         # already enforces these by hand, and it is a frozen Task 29 contract

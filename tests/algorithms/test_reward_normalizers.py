@@ -174,6 +174,28 @@ def test_group_mean_std_respects_the_dr_grpo_switch():
     _assert_bitwise_equal(_new_normalize(args_off, samples, raw), [-1.5, -0.5, 0.5, 1.5])
 
 
+@pytest.mark.parametrize("grpo_std_normalization", [True, False])
+def test_m2po_uses_the_same_group_relative_rewards_as_grpo(grpo_std_normalization):
+    """M2PO replaces GRPO's policy clip, not its reward advantage.
+
+    Main's pre-registry whitelist accidentally omitted M2PO; the official
+    recipe composes the M2PO loss with a GRPO advantage estimator.
+    """
+    raw = [0.0, 1.0, 2.0, 3.0]
+    samples = _samples([0, 0, 0, 0])
+    grpo = _new_normalize(
+        _args("grpo", grpo_std_normalization=grpo_std_normalization),
+        samples,
+        raw,
+    )
+    m2po = _new_normalize(
+        _args("m2po", grpo_std_normalization=grpo_std_normalization),
+        samples,
+        raw,
+    )
+    _assert_bitwise_equal(m2po, grpo)
+
+
 def test_grouping_is_driven_by_group_index_not_position():
     """Group membership follows ``group_index``, not batch position.
 

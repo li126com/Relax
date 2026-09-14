@@ -57,21 +57,25 @@ Edit `ALGORITHM_SPECS` in `relax/algorithms/spec.py`:
 "my_algo": AlgorithmSpec(
     name="my_algo",
     reward_normalizer="group_mean_std",   # reuse an existing one, or see step 2
+    requires_complete_reward_groups=True,
     advantage_fn="grpo_broadcast",
     policy_loss_fn="ppo_clip",
 ),
 ```
 
 If your algorithm is identical to an existing one at some stage, reuse that
-identifier. GRPO, GSPO, SAPO and CISPO are equivalent at the advantage layer,
-so all four share `"grpo_broadcast"`.
+identifier. GRPO, GSPO, SAPO, CISPO, M2PO and RLOO are equivalent at the
+advantage layer, so all six share `"grpo_broadcast"`.
 
 Capability fields:
 
 | Field | Effect |
 |-------|--------|
+| `requires_complete_reward_groups` | Preserve complete prompt groups during debug subsampling when reward processing relies on group-level statistics; currently consumed by debug-data selection |
 | `kl_level` | `"token"` or `"sequence"` (GSPO constrains the sequence) |
 | `needs_full_log_probs` | Whether the loss needs CP-gathered full log probs |
+| `supports_context_parallel` | Whether the policy kernel is correct on CP-sharded responses; `False` rejects static and dynamic CP at startup |
+| `policy_scalar_metric_names` | Names, in return order, for extra scalar diagnostics produced by the policy adapter |
 | `advantage_normalization` | What `--normalize-advantages` does: `"whiten"` (masked whitening) or `"token_global"` (REINFORCE++'s global token-level normalization, which also switches on the mask-safe loss reducer) |
 | `needs_critic` | Whether a critic service is required; drives `args.use_critic` |
 | `requires_normalize_advantages` | Demand `--normalize-advantages` |
@@ -82,16 +86,14 @@ Capability fields:
 | `requires_global_token_loss` | Demand `--calculate-per-token-loss`; the per-sample token-mean reducer would reweight responses by `1 / response_length` |
 | `requires_on_policy_updates` | Rejects five knobs at once: `--fully-async` / `--hybrid`, `--max-staleness != 0`, `--num-steps-per-rollout != 1`, `rollout_batch_size * n_samples != global_batch_size`, and `--partial-rollout` / `--use-dynamic-global-batch-size`. For objectives with no importance-ratio correction |
 
-The four `validate_*` functions in `relax/utils/arguments.py` consume every
-field in that table except `kl_level`, `needs_full_log_probs` and
-`advantage_normalization`, so for the rest, declaring the field is enough — you
-do not add an `if` there. (They are four rather than one because argument
-validation has a derivation order: `--kl-coef` has to be settled before
-validation demands that `--ref-load` exist on disk, and the one-update equality
-cannot be checked until `global_batch_size` has taken its final value. Neither
-has anything to do with the algorithm being special.) Those three fields are
-read in `relax/backends/megatron/loss.py` instead: a genuinely new value needs a
-branch there, an existing one does not.
+The `validate_*` functions in `relax/utils/arguments.py` consume the startup
+constraint fields. Runtime consumers read the remaining capabilities: reward
+dispatch uses `reward_normalizer`, debug subsampling uses
+`requires_complete_reward_groups`, and the policy path uses the KL,
+normalization, full-log-probability and scalar-metric declarations.
+Declaring an existing capability is enough; do not add an algorithm-name `if`
+to those consumers. A genuinely new enum value or implementation still needs
+one generic handler for that value.
 
 ### 2. Write pure functions for genuinely new maths
 
@@ -110,8 +112,8 @@ REWARD_NORMALIZERS["my_strategy"] = normalize_my_strategy
 ```
 
 The output must be **one scalar per sample**. That constraint is what keeps the
-TransferQueue schema fixed — an algorithm reading several reward components collapses them
-components to a scalar here.
+TransferQueue schema fixed — an algorithm reading several reward components
+collapses them to a scalar here.
 
 **Advantage estimator** (`relax/algorithms/advantages.py`), signature
 `fn(args, *, rewards, kl, loss_masks, response_lengths, total_lengths, values)`
@@ -126,8 +128,20 @@ ADVANTAGE_FNS["my_algo"] = advantage_my_algo
 ```
 
 **Policy loss** (`relax/algorithms/policy.py`), signature
-`fn(args, *, log_probs, ppo_kl, advantages) -> (pg_loss, pg_clipfrac)`. The
-underlying kernels take different argument lists; the adapter normalizes them.
+`fn(args, *, log_probs, ppo_kl, advantages, loss_masks) -> (pg_loss,
+pg_clipfrac, *scalar_metrics)`. The underlying kernels take different argument
+lists; the adapter normalizes them. Most adapters return only the first two
+values. If yours returns scalar diagnostics, declare their names in
+`policy_scalar_metric_names` in the same order. Each diagnostic must contain
+exactly one value; the shared policy path applies the current sample/token
+reducer before logging it. Real diagnostics are normalized to float32 so one
+adapter cannot promote the distributed logging vector; complex values are
+rejected.
+
+If the policy kernel introduces CLI parameters with a restricted numeric
+domain, add one validator to `POLICY_LOSS_ARG_VALIDATORS`. Validation is looked
+up through `policy_loss_fn`, so every algorithm reusing that kernel inherits the
+same startup checks without another algorithm-name branch.
 
 ### 3. Write unit tests
 

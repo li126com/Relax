@@ -193,10 +193,8 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         return raw_rewards, processed_rewards
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
-    # Second short-circuit: this one replaces the normalizer wholesale. Any
-    # algorithm whose reward stage is load-bearing would be silently skipped
-    # here while the run still reports itself as that algorithm; none of the
-    # currently registered normalizers is, so this stays as it was.
+    # This explicit custom-advantage hook replaces the registered reward
+    # normalizer wholesale by design.
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
 
@@ -447,7 +445,7 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
         original_num_rows = len(data)
         if (
             args.custom_reward_post_process_path is None
-            and get_algorithm(args.advantage_estimator).is_group_normalized
+            and get_algorithm(args.advantage_estimator).requires_complete_reward_groups
             and args.rewards_normalization
         ):
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))

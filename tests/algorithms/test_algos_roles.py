@@ -51,10 +51,9 @@ def test_algos_is_derived_from_the_registry_not_hand_written():
 def test_role_topology_is_driven_by_needs_critic():
     """Which component classes an algorithm binds must come from the spec.
 
-    Scoped to the ALGOS derivation on purpose. `process_role` still branches on
-    the literal "ppo" to pick the role *iteration order*; that is the
-    controller's orchestration surface, it is untouched by this change, and
-    folding it in would be a separate proposal.
+    ``process_role`` consumes the same capability through
+    ``algorithm_needs_critic`` so a second value-based estimator follows the
+    complete critic topology without another name check.
     """
     src = REGISTRY_PATH.read_text(encoding="utf-8")
 
@@ -115,7 +114,16 @@ def test_ppo_keeps_its_critic():
 
 @requires_megatron
 def test_policy_gradient_algorithms_have_no_critic():
-    for name in ("grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus"):
+    for name in (
+        "grpo",
+        "gspo",
+        "sapo",
+        "cispo",
+        "m2po",
+        "rloo",
+        "reinforce_plus_plus",
+        "reinforce_plus_plus_baseline",
+    ):
         assert ROLES.critic not in ALGOS[name], f"{name} would start a critic service it never uses"
 
 

@@ -2,8 +2,11 @@
 
 """Policy loss selection must come from the registry."""
 
+import ast
+import dataclasses
+import inspect
+import math
 import pathlib
-import re
 from types import SimpleNamespace
 
 import pytest
@@ -12,17 +15,22 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from relax.algorithms.policy import POLICY_LOSS_FNS, compute_policy_loss_for  # noqa: E402
-from relax.algorithms.spec import get_algorithm, list_algorithm_names  # noqa: E402
+from relax.algorithms.spec import ALGORITHM_SPECS, get_algorithm, list_algorithm_names  # noqa: E402
 from relax.utils.training.ppo_utils import (  # noqa: E402
+    _m2po_work_dtype,
+    _solve_tau_from_sorted_delta2,
     compute_cispo_loss,
+    compute_m2po_loss,
     compute_policy_loss,
     compute_sapo_loss,
+    kpo_clip_harmful_tokens,
 )
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 LOSS_PATH = REPO_ROOT / "relax" / "backends" / "megatron" / "loss.py"
 SERVE_PATH = REPO_ROOT / "relax" / "components" / "advantages.py"
+NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
 
 
 def _args(estimator, **overrides):
@@ -32,6 +40,9 @@ def _args(estimator, **overrides):
         eps_clip_high=0.2,
         sapo_tau_pos=1.0,
         sapo_tau_neg=1.05,
+        m2po_kl2_budget=0.01,
+        m2po_miniclip_low=0.3,
+        m2po_miniclip_high=0.5,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -40,6 +51,54 @@ def _args(estimator, **overrides):
 def _tensors():
     torch.manual_seed(0)
     return torch.randn(8), torch.randn(8), torch.randn(8)
+
+
+def _legacy_solve_tau_from_sorted_delta2(sorted_delta2, target_sum):
+    """Frozen pre-refactor implementation used as a numerical oracle."""
+    n = sorted_delta2.numel()
+    total = float(sorted_delta2.sum().item())
+    if target_sum >= total - 1e-12:
+        return 100000.0, total / n
+    if target_sum <= 1e-12:
+        return 0.0, 0.0
+    csum = torch.cumsum(sorted_delta2, dim=0)
+    for k in range(n):
+        left_sum = float(csum[k].item())
+        rest = n - k - 1
+        m2 = sorted_delta2[k].item() - 1e-12
+        if m2 * rest + left_sum >= target_sum - 1e-12:
+            if k == 0:
+                return 0.0, float(csum[-1].item()) / n
+            m2_after = (sorted_delta2[k - 1].item() * (rest + 1) + float(csum[k - 1].item())) / n
+            return max(sorted_delta2[k - 1].item() - 1e-12, 0.0) ** 0.5, m2_after
+    return 100000.0, total / n
+
+
+def _legacy_compute_m2po_loss(ppo_kl, advantages, kl2_budget, miniclip_low, miniclip_high):
+    """Frozen M2PO loss before device-side threshold vectorisation."""
+    ratio = (-ppo_kl).exp()
+    pos_harmful = (advantages > 1e-12) & (ratio > 1.0 + 1e-12)
+    neg_harmful = (advantages < -1e-12) & (ratio < 1.0 - 1e-12)
+    tr_delta_sq = ppo_kl[pos_harmful | neg_harmful].pow(2)
+    n = tr_delta_sq.numel()
+    if n == 0:
+        clip_low, clip_high, m2_now, m2_after = 0.0, 100000.0, 0.0, 0.0
+    else:
+        m2_now = float(tr_delta_sq.sum().detach().item() / n)
+        if m2_now <= kl2_budget + 1e-12:
+            clip_low, clip_high, m2_after = 0.0, 100000.0, m2_now
+        else:
+            sorted_delta2, _ = torch.sort(tr_delta_sq)
+            tau, m2_after = _legacy_solve_tau_from_sorted_delta2(sorted_delta2, kl2_budget * float(n))
+            clip_low, clip_high = math.exp(-tau), math.exp(tau)
+
+    eps_low = max(1.0 - clip_low, miniclip_low)
+    eps_high = max(clip_high - 1.0, miniclip_high)
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * ratio.clamp(1.0 - eps_low, 1.0 + eps_high)
+    pg_loss = torch.maximum(pg_losses1, pg_losses2)
+    clipfrac = (pg_losses2 > pg_losses1).float()
+    return pg_loss, clipfrac, m2_now, m2_after, eps_low, eps_high
 
 
 # ---------------- registry ----------------
@@ -92,6 +151,249 @@ def test_cispo_matches_the_underlying_kernel():
     assert torch.equal(got[1], want[1])
 
 
+def test_m2po_matches_the_underlying_kernel_and_names_its_scalar_metrics():
+    log_probs, ppo_kl, advantages = _tensors()
+    args = _args("m2po", m2po_kl2_budget=0.02, m2po_miniclip_low=0.25, m2po_miniclip_high=0.4)
+
+    got_loss, got_clipfrac, got_metrics = compute_policy_loss_for(
+        args,
+        log_probs=log_probs,
+        ppo_kl=ppo_kl,
+        advantages=advantages,
+        loss_masks=[torch.ones_like(ppo_kl)],
+    )
+    want_loss, want_clipfrac, *want_metrics = compute_m2po_loss(
+        ppo_kl=ppo_kl,
+        advantages=advantages,
+        kl2_budget=args.m2po_kl2_budget,
+        miniclip_low=args.m2po_miniclip_low,
+        miniclip_high=args.m2po_miniclip_high,
+        loss_mask=torch.ones_like(ppo_kl),
+    )
+
+    assert torch.equal(got_loss, want_loss)
+    assert torch.equal(got_clipfrac, want_clipfrac)
+    assert list(got_metrics) == list(get_algorithm("m2po").policy_scalar_metric_names)
+    for value, expected in zip(got_metrics.values(), want_metrics, strict=True):
+        assert torch.equal(value, torch.as_tensor(expected, device=ppo_kl.device))
+        assert value.requires_grad is False
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    ("values", "target_sum"),
+    [
+        ([1.0, 4.0, 9.0], 14.0),  # no clipping
+        ([1.0, 4.0, 9.0], 0.0),  # clip everything
+        ([1.0, 4.0, 9.0], 1.0),  # first breakpoint (k=0)
+        ([1.0, 4.0, 9.0], 8.0),  # interior breakpoint (k>0)
+        ([1.0, 4.0, 9.0], 10.0),
+        ([1.0, 1.0, 4.0, 4.0], 4.0),  # repeated values at the 1e-12 boundary
+        ([0.1, 0.2, 0.4], 0.15),  # sum() and cumsum() round differently at k=0
+        ([0.0, 0.0], 0.0),  # preserves the legacy branch order
+    ],
+)
+def test_m2po_vectorized_tau_solver_matches_legacy_boundaries(dtype, values, target_sum):
+    sorted_delta2 = torch.tensor(values, dtype=dtype)
+    expected_tau, expected_m2 = _legacy_solve_tau_from_sorted_delta2(sorted_delta2, target_sum)
+    actual_tau, actual_m2 = _solve_tau_from_sorted_delta2(sorted_delta2, target_sum)
+
+    torch.testing.assert_close(actual_tau, actual_tau.new_tensor(expected_tau), rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(actual_m2, actual_m2.new_tensor(expected_m2), rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+def test_m2po_vectorized_tau_solver_matches_legacy_random_cases(dtype):
+    generator = torch.Generator().manual_seed(2026)
+    for size in (1, 2, 7, 31):
+        sorted_delta2 = torch.sort(torch.rand(size, generator=generator).square().to(dtype=dtype)).values
+        total = float(sorted_delta2.sum().item())
+        for fraction in (0.0, 0.01, 0.25, 0.75, 1.0, 1.1):
+            target_sum = total * fraction
+            expected_tau, expected_m2 = _legacy_solve_tau_from_sorted_delta2(sorted_delta2, target_sum)
+            actual_tau, actual_m2 = _solve_tau_from_sorted_delta2(sorted_delta2, target_sum)
+            torch.testing.assert_close(actual_tau, actual_tau.new_tensor(expected_tau), rtol=1e-12, atol=1e-12)
+            torch.testing.assert_close(actual_m2, actual_m2.new_tensor(expected_m2), rtol=1e-12, atol=1e-12)
+
+
+def test_m2po_vectorized_tau_solver_handles_empty_input():
+    tau, m2_after = _solve_tau_from_sorted_delta2(torch.empty(0), target_sum=0.0)
+    assert tau == 100000.0
+    assert m2_after == 0.0
+
+
+def test_m2po_work_dtype_avoids_float64_on_npu():
+    fake_npu_tensor = SimpleNamespace(device=SimpleNamespace(type="npu"))
+    assert _m2po_work_dtype(fake_npu_tensor) == torch.float32
+    assert _m2po_work_dtype(torch.empty(0)) == torch.float64
+
+
+@pytest.mark.skipif(not NPU_AVAILABLE, reason="requires an Ascend NPU")
+@pytest.mark.parametrize(
+    ("ppo_kl", "advantages"),
+    [
+        ([0.0, 0.0], [1.0, -1.0]),
+        ([-0.8, -0.4, 0.2, 0.7], [1.0, 1.0, -1.0, -1.0]),
+    ],
+)
+def test_m2po_npu_clipping_path_matches_cpu_reference(ppo_kl, advantages):
+    cpu_ppo_kl = torch.tensor(ppo_kl, dtype=torch.float32)
+    cpu_advantages = torch.tensor(advantages, dtype=torch.float32)
+    expected = _legacy_compute_m2po_loss(cpu_ppo_kl, cpu_advantages, 0.02, 0.3, 0.5)
+
+    npu_ppo_kl = cpu_ppo_kl.to("npu").requires_grad_()
+    npu_advantages = cpu_advantages.to("npu")
+    actual = compute_m2po_loss(
+        npu_ppo_kl,
+        npu_advantages,
+        kl2_budget=0.02,
+        miniclip_low=0.3,
+        miniclip_high=0.5,
+        loss_mask=torch.ones_like(npu_advantages),
+    )
+
+    torch.testing.assert_close(actual[0].cpu(), expected[0], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual[1].cpu(), expected[1], rtol=0, atol=0)
+    assert all(value.device.type == "npu" for value in actual)
+    assert all(torch.isfinite(value).all() for value in actual)
+    actual[0].sum().backward()
+    assert torch.isfinite(npu_ppo_kl.grad).all()
+
+
+def test_m2po_vectorized_loss_matches_legacy_values_and_gradients():
+    base_ppo_kl = torch.tensor([-0.8, -0.4, -0.1, 0.2, 0.7], dtype=torch.float64)
+    advantages = torch.tensor([1.0, 1.0, -1.0, -1.0, -1.0], dtype=torch.float64)
+    kwargs = dict(kl2_budget=0.02, miniclip_low=0.3, miniclip_high=0.5)
+
+    actual_ppo_kl = base_ppo_kl.clone().requires_grad_()
+    actual = compute_m2po_loss(actual_ppo_kl, advantages, loss_mask=torch.ones_like(advantages), **kwargs)
+    actual[0].sum().backward()
+
+    expected_ppo_kl = base_ppo_kl.clone().requires_grad_()
+    expected = _legacy_compute_m2po_loss(expected_ppo_kl, advantages, **kwargs)
+    expected[0].sum().backward()
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+    for actual_metric, expected_metric in zip(actual[2:], expected[2:], strict=True):
+        assert float(actual_metric) == pytest.approx(expected_metric, rel=1e-6, abs=1e-7)
+        assert actual_metric.requires_grad is False
+    torch.testing.assert_close(actual_ppo_kl.grad, expected_ppo_kl.grad, rtol=1e-12, atol=1e-12)
+
+
+def test_m2po_threshold_hot_path_has_no_host_scalar_sync_or_python_token_loop():
+    for function in (_solve_tau_from_sorted_delta2, kpo_clip_harmful_tokens):
+        tree = ast.parse(inspect.getsource(function))
+        assert not any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(tree))
+        host_scalar_calls = [
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"item", "tolist"}
+        ]
+        assert host_scalar_calls == []
+
+
+def test_m2po_masked_outlier_does_not_change_valid_token_clip_bounds():
+    ppo_kl = torch.tensor([-0.4, -0.1, -5.0])
+    advantages = torch.ones(3)
+    loss_mask = torch.tensor([1.0, 1.0, 0.0])
+
+    masked = compute_m2po_loss(ppo_kl, advantages, 0.01, loss_mask=loss_mask)
+    valid_only = compute_m2po_loss(ppo_kl[:2], advantages[:2], 0.01, loss_mask=loss_mask[:2])
+    unmasked = compute_m2po_loss(ppo_kl, advantages, 0.01)
+
+    assert torch.equal(masked[0][:2], valid_only[0])
+    assert torch.equal(masked[1][:2], valid_only[1])
+    assert masked[2:] == valid_only[2:]
+    assert masked[2:] != unmasked[2:]
+
+
+def test_m2po_requires_the_dispatcher_to_supply_a_loss_mask():
+    log_probs, ppo_kl, advantages = _tensors()
+    with pytest.raises(ValueError, match="requires loss masks"):
+        compute_policy_loss_for(_args("m2po"), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
+
+
+def test_dispatch_rejects_scalar_metric_count_drift(monkeypatch):
+    log_probs, ppo_kl, advantages = _tensors()
+    monkeypatch.setitem(
+        POLICY_LOSS_FNS,
+        "ppo_clip",
+        lambda *args, **kwargs: (torch.zeros_like(ppo_kl), torch.zeros_like(ppo_kl), 1.0),
+    )
+    with pytest.raises(ValueError, match="returned 1 scalar metrics, but its spec declares 0"):
+        compute_policy_loss_for(_args("grpo"), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
+
+
+def test_dispatch_rejects_a_non_scalar_declared_metric(monkeypatch):
+    log_probs, ppo_kl, advantages = _tensors()
+    monkeypatch.setitem(
+        ALGORITHM_SPECS,
+        "grpo",
+        dataclasses.replace(get_algorithm("grpo"), policy_scalar_metric_names=("probe",)),
+    )
+    monkeypatch.setitem(
+        POLICY_LOSS_FNS,
+        "ppo_clip",
+        lambda *args, **kwargs: (
+            torch.zeros_like(ppo_kl),
+            torch.zeros_like(ppo_kl),
+            torch.ones(2),
+        ),
+    )
+    with pytest.raises(ValueError, match="metric 'probe' must be scalar"):
+        compute_policy_loss_for(_args("grpo"), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (torch.tensor(1.25, dtype=torch.float64), 1.25),
+        (torch.tensor(2, dtype=torch.int64), 2.0),
+        (torch.tensor(True), 1.0),
+    ],
+)
+def test_dispatch_normalizes_real_scalar_metrics_to_float32(monkeypatch, value, expected):
+    log_probs, ppo_kl, advantages = _tensors()
+    monkeypatch.setitem(
+        ALGORITHM_SPECS,
+        "grpo",
+        dataclasses.replace(get_algorithm("grpo"), policy_scalar_metric_names=("probe",)),
+    )
+    monkeypatch.setitem(
+        POLICY_LOSS_FNS,
+        "ppo_clip",
+        lambda *args, **kwargs: (torch.zeros_like(ppo_kl), torch.zeros_like(ppo_kl), value),
+    )
+
+    _, _, metrics = compute_policy_loss_for(_args("grpo"), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
+
+    assert metrics["probe"].dtype == torch.float32
+    assert metrics["probe"] == expected
+
+
+def test_dispatch_rejects_a_complex_scalar_metric(monkeypatch):
+    log_probs, ppo_kl, advantages = _tensors()
+    monkeypatch.setitem(
+        ALGORITHM_SPECS,
+        "grpo",
+        dataclasses.replace(get_algorithm("grpo"), policy_scalar_metric_names=("probe",)),
+    )
+    monkeypatch.setitem(
+        POLICY_LOSS_FNS,
+        "ppo_clip",
+        lambda *args, **kwargs: (
+            torch.zeros_like(ppo_kl),
+            torch.zeros_like(ppo_kl),
+            torch.tensor(1 + 2j),
+        ),
+    )
+    with pytest.raises(ValueError, match="metric 'probe' must be real-valued"):
+        compute_policy_loss_for(_args("grpo"), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
+
+
 def test_sapo_defaults_when_args_lack_tau_fields():
     log_probs, ppo_kl, advantages = _tensors()
     args = SimpleNamespace(advantage_estimator="sapo", eps_clip=0.2, eps_clip_high=0.2)
@@ -116,21 +418,53 @@ def test_ppo_clip_family_share_one_loss(estimator):
     assert torch.equal(reference[0], actual[0])
 
 
+@pytest.mark.parametrize(
+    "estimator",
+    ["grpo", "gspo", "sapo", "cispo", "rloo", "ppo", "reinforce_plus_plus", "reinforce_plus_plus_baseline"],
+)
+def test_policy_losses_without_scalar_diagnostics_return_an_empty_mapping(estimator):
+    log_probs, ppo_kl, advantages = _tensors()
+    _, _, metrics = compute_policy_loss_for(
+        _args(estimator), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages
+    )
+    assert metrics == {}
+
+
 # ---------------- call sites no longer branch on names ----------------
 
 
-# Any comparison of the estimator against a literal name, in any of the shapes
-# Python offers: `== "x"`, `!= "x"`, `in [...]`, `in {...}`, `in (...)`.
-#
-# This used to be a hand-written list of the exact strings the refactor had
-# deleted. It missed a live one: the REINFORCE++ checks in loss.py were written
-# `in {` and the list only banned `in [`, so two algorithm-name sets survived
-# the refactor with a green test sitting on top of them.
-ESTIMATOR_NAME_CHECK = re.compile(r"""advantage_estimator\s*(?:==|!=|\bin\b)\s*[\[{("']""")
+def _is_raw_estimator_expression(node: ast.AST) -> bool:
+    if isinstance(node, ast.Attribute):
+        return node.attr == "advantage_estimator"
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and node.args[1].value == "advantage_estimator"
+    )
+
+
+def _contains_string_literal(node: ast.AST) -> bool:
+    return any(isinstance(child, ast.Constant) and isinstance(child.value, str) for child in ast.walk(node))
 
 
 def _name_checks(source: str) -> list[str]:
-    return [line.strip() for line in source.splitlines() if ESTIMATOR_NAME_CHECK.search(line)]
+    """Find raw estimator-vs-literal comparisons without matching spec
+    fields."""
+    lines = source.splitlines()
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Compare):
+            continue
+        operands = [node.left, *node.comparators]
+        raw_estimator_positions = {i for i, operand in enumerate(operands) if _is_raw_estimator_expression(operand)}
+        if raw_estimator_positions and any(
+            _contains_string_literal(operand) for i, operand in enumerate(operands) if i not in raw_estimator_positions
+        ):
+            found.append(lines[node.lineno - 1].strip())
+    return found
 
 
 def test_loss_py_no_longer_branches_on_estimator_names():
@@ -154,13 +488,17 @@ def test_the_name_check_pattern_catches_every_spelling():
         'if args.advantage_estimator in ["grpo", "gspo"]:',
         'x = args.advantage_estimator in {"reinforce_plus_plus"}',
         'if self.config.advantage_estimator in ("ppo",):',
+        'if getattr(args, "advantage_estimator", None) == "m2po":',
+        'if "rloo" == args.advantage_estimator:',
     ):
-        assert _name_checks(spelling) == [spelling], spelling
+        source = f"{spelling}\n    pass" if spelling.startswith("if ") else spelling
+        assert _name_checks(source) == [spelling], spelling
     for allowed in (
         "spec = get_algorithm(args.advantage_estimator)",
         'if get_algorithm(args.advantage_estimator).advantage_normalization == "token_global":',
     ):
-        assert _name_checks(allowed) == [], allowed
+        source = f"{allowed}\n    pass" if allowed.startswith("if ") else allowed
+        assert _name_checks(source) == [], allowed
 
 
 def test_both_paths_delegate_to_the_shared_estimator():

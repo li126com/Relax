@@ -12,6 +12,9 @@ import pytest
 
 
 ARGS_PATH = pathlib.Path(__file__).resolve().parents[2] / "relax" / "utils" / "arguments.py"
+M2PO_ASYNC_SCRIPT = (
+    pathlib.Path(__file__).resolve().parents[2] / "scripts" / "training" / "text" / "run-qwen3-4B-8xgpu-m2po-async.sh"
+)
 
 
 @pytest.fixture()
@@ -60,6 +63,9 @@ def _args(estimator="grpo", **overrides):
         fully_async=False,
         hybrid=False,
         dynamic_sampling_filter_path=None,
+        m2po_kl2_budget=0.01,
+        m2po_miniclip_low=0.3,
+        m2po_miniclip_high=0.5,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -91,6 +97,7 @@ def test_validation_reads_spec_fields():
     for field in (
         "needs_critic",
         "requires_normalize_advantages",
+        "supports_context_parallel",
     ):
         assert field in src, f"arguments.py does not consult spec.{field}"
 
@@ -139,7 +146,7 @@ def test_ppo_is_runnable_and_turns_on_the_critic(arguments_module):
     assert args.use_critic is True
 
 
-@pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo"])
+@pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo", "m2po"])
 def test_grpo_family_passes_with_defaults(arguments_module, estimator):
     args = _args(estimator, reward_key=None)
     arguments_module.validate_algorithm_args(args)
@@ -270,6 +277,25 @@ def test_yaml_without_algorithm_changes_is_accepted(arguments_module, tmp_path):
     assert args.advantage_estimator == "grpo"
 
 
+@pytest.mark.parametrize(
+    ("initial_loss_type", "yaml_loss_type"),
+    [
+        pytest.param("policy_loss", "sft", id="rl-to-sft"),
+        pytest.param("sft", "policy_loss", id="sft-to-rl"),
+    ],
+)
+def test_yaml_cannot_change_the_training_mode(arguments_module, tmp_path, initial_loss_type, yaml_loss_type):
+    args = _overridable_args(
+        tmp_path,
+        f"loss_type: {yaml_loss_type}\n",
+        loss_type=initial_loss_type,
+        advantage_estimator="ppo",
+    )
+
+    with pytest.raises(ValueError, match="cannot change loss_type"):
+        arguments_module.apply_custom_config_overrides(args)
+
+
 def test_no_yaml_is_a_no_op(arguments_module):
     args = _args("grpo", reward_key=None)
     args.loss_type = "policy_loss"
@@ -310,10 +336,60 @@ def test_spec_with_an_unregistered_implementation_is_rejected_at_startup(argumen
 # ---------------- fully-async ----------------
 
 
-@pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo"])
+@pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo", "m2po"])
 def test_other_estimators_are_unaffected_by_fully_async(arguments_module, estimator):
     args = _args(estimator, fully_async=True, reward_key=None)
     arguments_module.validate_algorithm_args(args)
+
+
+def test_m2po_accepts_context_parallel_size_one(arguments_module):
+    arguments_module.validate_algorithm_args(
+        _args("m2po", context_parallel_size=1, dynamic_context_parallel=False, reward_key=None)
+    )
+
+
+def test_m2po_rejects_static_context_parallel_sharding(arguments_module):
+    with pytest.raises(ValueError, match="context-parallel-size 1"):
+        arguments_module.validate_algorithm_args(
+            _args("m2po", context_parallel_size=2, dynamic_context_parallel=False, reward_key=None)
+        )
+
+
+def test_m2po_rejects_dynamic_context_parallel_sharding(arguments_module):
+    with pytest.raises(ValueError, match="dynamic-context-parallel disabled"):
+        arguments_module.validate_algorithm_args(
+            _args("m2po", context_parallel_size=1, dynamic_context_parallel=True, reward_key=None)
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        pytest.param("m2po_kl2_budget", -0.01, "kl2-budget", id="negative-budget"),
+        pytest.param("m2po_kl2_budget", float("nan"), "kl2-budget", id="nan-budget"),
+        pytest.param("m2po_kl2_budget", float("inf"), "kl2-budget", id="infinite-budget"),
+        pytest.param("m2po_miniclip_low", -0.01, "miniclip-low", id="negative-low-floor"),
+        pytest.param("m2po_miniclip_low", 1.01, "miniclip-low", id="low-floor-above-one"),
+        pytest.param("m2po_miniclip_high", -0.01, "miniclip-high", id="negative-high-floor"),
+        pytest.param("m2po_miniclip_high", float("nan"), "miniclip-high", id="nan-high-floor"),
+    ],
+)
+def test_m2po_rejects_invalid_policy_bounds(arguments_module, field, value, expected):
+    with pytest.raises(ValueError, match=expected):
+        arguments_module.validate_algorithm_args(_args("m2po", reward_key=None, **{field: value}))
+
+
+def test_m2po_policy_bounds_do_not_constrain_other_policy_losses(arguments_module):
+    arguments_module.validate_algorithm_args(_args("grpo", reward_key=None, m2po_miniclip_low=2.0))
+
+
+def test_m2po_async_script_uses_the_stale_rollout_policy_for_its_ratio():
+    src = M2PO_ASYNC_SCRIPT.read_text(encoding="utf-8")
+    assert "\n   --use-rollout-logprobs\n" in src
+    assert "\n   --use-tis\n" not in src
+    assert '"actor_fwd": [1, 2]' in src, "the current fully-async service graph still requires actor_fwd"
+    assert "--num-iters-per-train-update 4" in src, "async transfer size must contain at least one prompt group"
+    assert "--clearml-key-filter" not in src, "unknown CLI options are silently ignored"
 
 
 # ---------------- a YAML global_batch_size must not be derived over ----------------

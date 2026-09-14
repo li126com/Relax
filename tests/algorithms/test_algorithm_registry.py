@@ -10,11 +10,13 @@ from relax.algorithms import get_algorithm, list_algorithm_names
 from relax.algorithms.spec import ALGORITHM_SPECS, AlgorithmSpec
 
 
-EXPECTED_NAMES = [
+MAIN_ALGORITHM_NAMES = [
     "grpo",
     "gspo",
     "sapo",
     "cispo",
+    "m2po",
+    "rloo",
     "ppo",
     "reinforce_plus_plus",
     "reinforce_plus_plus_baseline",
@@ -22,8 +24,7 @@ EXPECTED_NAMES = [
 
 
 def test_all_expected_algorithms_registered():
-    for name in EXPECTED_NAMES:
-        assert name in ALGORITHM_SPECS, f"{name} missing from ALGORITHM_SPECS"
+    assert list_algorithm_names() == MAIN_ALGORITHM_NAMES
 
 
 def test_spec_name_matches_dict_key():
@@ -48,43 +49,59 @@ def test_list_algorithm_names_matches_registry_keys():
 
 
 def test_grpo_family_shares_one_advantage_fn():
-    """grpo/gspo/sapo/cispo are identical at the advantage layer."""
-    ids = {get_algorithm(n).advantage_fn for n in ("grpo", "gspo", "sapo", "cispo")}
+    """The outcome-reward estimators are identical at the advantage layer."""
+    ids = {get_algorithm(n).advantage_fn for n in ("grpo", "gspo", "sapo", "cispo", "m2po", "rloo")}
     assert ids == {"grpo_broadcast"}
 
 
 def test_reward_normalizer_ids_match_current_behavior():
-    for name in ("grpo", "gspo", "sapo", "cispo"):
+    for name in ("grpo", "gspo", "sapo", "cispo", "m2po"):
         assert get_algorithm(name).reward_normalizer == "group_mean_std"
     assert get_algorithm("reinforce_plus_plus_baseline").reward_normalizer == "group_mean"
+    assert get_algorithm("rloo").reward_normalizer == "group_leave_one_out"
     for name in ("ppo", "reinforce_plus_plus"):
         assert get_algorithm(name).reward_normalizer == "none"
 
 
-def test_is_group_normalized_matches_the_legacy_whitelist():
-    """The pre-registry whitelist, exactly.
+def test_is_group_normalized_matches_the_intended_reward_scope():
+    intended = {
+        "grpo",
+        "gspo",
+        "sapo",
+        "cispo",
+        "m2po",
+        "rloo",
+        "reinforce_plus_plus_baseline",
+    }
+    actual = {n for n in MAIN_ALGORITHM_NAMES if get_algorithm(n).is_group_normalized}
+    assert actual == intended
 
-    group.
-    """
-    legacy = {"grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"}
-    actual = {n for n in EXPECTED_NAMES if get_algorithm(n).is_group_normalized}
-    assert actual == legacy
+
+def test_non_none_normalizer_is_not_implicitly_treated_as_group_scoped():
+    spec = AlgorithmSpec(
+        name="future_batch_algorithm",
+        reward_normalizer="future_batch_normalizer",
+        advantage_fn="grpo_broadcast",
+        policy_loss_fn="ppo_clip",
+    )
+    assert spec.requires_complete_reward_groups is False
+    assert spec.is_group_normalized is False
 
 
 def test_gspo_is_the_only_sequence_level_kl():
-    seq = {n for n in EXPECTED_NAMES if get_algorithm(n).kl_level == "sequence"}
+    seq = {n for n in MAIN_ALGORITHM_NAMES if get_algorithm(n).kl_level == "sequence"}
     assert seq == {"gspo"}
 
 
 def test_gspo_is_the_only_one_needing_full_log_probs():
-    need = {n for n in EXPECTED_NAMES if get_algorithm(n).needs_full_log_probs}
+    need = {n for n in MAIN_ALGORITHM_NAMES if get_algorithm(n).needs_full_log_probs}
     assert need == {"gspo"}
 
 
 def test_ppo_is_the_only_algorithm_needing_a_critic():
     """`needs_critic` is what `relax/core/registry.py` reads to decide whether
     ALGOS binds the Critic component, so this set is load-bearing."""
-    critic = {n for n in EXPECTED_NAMES if get_algorithm(n).needs_critic}
+    critic = {n for n in MAIN_ALGORITHM_NAMES if get_algorithm(n).needs_critic}
     assert critic == {"ppo"}
 
 
@@ -97,6 +114,8 @@ def test_reinforce_family_requires_normalize_advantages():
 def test_policy_loss_ids_match_current_behavior():
     assert get_algorithm("sapo").policy_loss_fn == "sapo"
     assert get_algorithm("cispo").policy_loss_fn == "cispo"
+    assert get_algorithm("m2po").policy_loss_fn == "m2po"
+    assert get_algorithm("rloo").policy_loss_fn == "rloo"
     for name in ("grpo", "gspo", "ppo", "reinforce_plus_plus", "reinforce_plus_plus_baseline"):
         assert get_algorithm(name).policy_loss_fn == "ppo_clip"
 
@@ -107,6 +126,36 @@ def test_defaults_are_permissive():
     assert spec.needs_full_log_probs is False
     assert spec.needs_critic is False
     assert spec.requires_normalize_advantages is False
+    assert spec.policy_scalar_metric_names == ()
+    assert spec.supports_context_parallel is True
+
+
+def test_m2po_declares_its_scalar_metrics_and_cp_limit():
+    spec = get_algorithm("m2po")
+    assert spec.policy_scalar_metric_names == (
+        "ppo_kl_m2_before",
+        "ppo_kl_m2_after",
+        "m2po_eps_low",
+        "m2po_eps_high",
+    )
+    assert spec.supports_context_parallel is False
+
+
+def test_context_parallel_support_matches_current_kernel_constraints():
+    unsupported = {name for name in MAIN_ALGORITHM_NAMES if not get_algorithm(name).supports_context_parallel}
+    assert unsupported == {"m2po", "reinforce_plus_plus", "reinforce_plus_plus_baseline"}
+
+
+@pytest.mark.parametrize("metric_names", [("",), ("duplicate", "duplicate")])
+def test_invalid_policy_scalar_metric_names_fail_when_the_spec_is_built(metric_names):
+    with pytest.raises(ValueError, match="policy scalar metric name"):
+        AlgorithmSpec(
+            name="probe",
+            reward_normalizer="none",
+            advantage_fn="grpo_broadcast",
+            policy_loss_fn="ppo_clip",
+            policy_scalar_metric_names=metric_names,
+        )
 
 
 def test_spec_module_has_no_heavy_imports():

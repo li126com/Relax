@@ -4,7 +4,6 @@
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
 import contextlib
-import math
 from argparse import Namespace
 from pathlib import Path
 
@@ -403,46 +402,116 @@ def compute_policy_loss(
 # Paper: "Prosperity before Collapse" (NeurIPS 2025), https://arxiv.org/abs/2510.01161
 
 
-def _solve_tau_from_sorted_delta2(sorted_delta2: torch.Tensor, target_sum: float) -> tuple[float, float]:
+def _m2po_work_dtype(tensor: torch.Tensor) -> torch.dtype:
+    """Use legacy host-float precision where the accelerator supports it."""
+    # Ascend does not guarantee float64 coverage for every elementwise op in
+    # this solver. Staying in float32 keeps the entire NPU path on device; its
+    # 1e-12 tie-breaker can differ only inside a sub-ULP boundary interval.
+    return torch.float32 if tensor.device.type == "npu" else torch.float64
+
+
+def _solve_tau_from_sorted_delta2(
+    sorted_delta2: torch.Tensor,
+    target_sum: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Solve the M2PO water-filling threshold without GPU-to-CPU syncs.
+
+    Reductions intentionally stay in the input dtype, matching the original
+    implementation. Breakpoint arithmetic then uses device-side float64 to
+    match the Python-float comparisons that the old ``.item()`` loop performed,
+    except on Ascend where float32 keeps the full operator chain supported.
+    """
     n = sorted_delta2.numel()
-    total = float(sorted_delta2.sum().item())
-    if target_sum >= total - 1e-12:
-        return 100000.0, total / n
-    if target_sum <= 1e-12:
-        return 0.0, 0.0
-    csum = torch.cumsum(sorted_delta2, dim=0)
-    for k in range(n):
-        left_sum = float(csum[k].item())
-        rest = n - k - 1
-        m2 = sorted_delta2[k].item() - 1e-12
-        if m2 * rest + left_sum >= target_sum - 1e-12:
-            if k == 0:
-                return 0.0, float(csum[-1].item()) / n
-            M2_after = (sorted_delta2[k - 1].item() * (rest + 1) + float(csum[k - 1].item())) / n
-            return max(sorted_delta2[k - 1].item() - 1e-12, 0.0) ** 0.5, M2_after
-    return 100000.0, total / n
+    work_dtype = _m2po_work_dtype(sorted_delta2)
+    zero = sorted_delta2.new_zeros((), dtype=work_dtype)
+    no_clip_tau = sorted_delta2.new_full((), 100000.0, dtype=work_dtype)
+    if n == 0:
+        return no_clip_tau, zero
+
+    total = sorted_delta2.sum().to(dtype=work_dtype)
+    csum = torch.cumsum(sorted_delta2, dim=0).to(dtype=work_dtype)
+    delta2 = sorted_delta2.to(dtype=work_dtype)
+    target = delta2.new_tensor(target_sum)
+
+    indices = torch.arange(n, device=sorted_delta2.device)
+    rest = (n - indices - 1).to(dtype=delta2.dtype)
+    crosses_target = (delta2 - 1e-12) * rest + csum >= target - 1e-12
+    has_crossing = crosses_target.any()
+    k = torch.argmax(crosses_target.to(dtype=torch.int64))
+
+    previous_index = torch.clamp_min(k - 1, 0)
+    previous_delta2 = delta2[previous_index]
+    normal_tau = torch.clamp_min(previous_delta2 - 1e-12, 0.0).sqrt()
+    normal_m2_after = (previous_delta2 * (n - k).to(dtype=delta2.dtype) + csum[previous_index]) / n
+
+    # Preserve the original k=0 diagnostic: tau is zero, while M2_after is
+    # reported from cumsum[-1] rather than recomputed at tau=0. Do not replace
+    # this with total: sum() and cumsum() can round differently.
+    first_crossing = k == 0
+    normal_tau = torch.where(first_crossing, zero, normal_tau)
+    normal_m2_after = torch.where(first_crossing, csum[-1] / n, normal_m2_after)
+    normal_tau = torch.where(has_crossing, normal_tau, no_clip_tau)
+    normal_m2_after = torch.where(has_crossing, normal_m2_after, total / n)
+
+    # The original branch order checked no-clipping before the zero target;
+    # retain it for tiny/empty-valued inputs where both predicates can hold.
+    no_clipping = target >= total - 1e-12
+    clip_everything = target <= 1e-12
+    tau = torch.where(no_clipping, no_clip_tau, torch.where(clip_everything, zero, normal_tau))
+    m2_after = torch.where(
+        no_clipping,
+        total / n,
+        torch.where(clip_everything, zero, normal_m2_after),
+    )
+    return tau, m2_after
 
 
-def _get_trust_region_delta_sq(ppo_kl: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
+def _get_trust_region_delta_sq(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if ppo_kl.shape != advantages.shape:
+        raise ValueError(f"M2PO expected matching KL and advantage shapes, got {ppo_kl.shape} and {advantages.shape}.")
     ratio = (-ppo_kl).exp()
     pos_harmful = (advantages > 1e-12) & (ratio > 1.0 + 1e-12)
     neg_harmful = (advantages < -1e-12) & (ratio < 1.0 - 1e-12)
-    return ppo_kl[pos_harmful | neg_harmful].pow(2)
+    harmful = pos_harmful | neg_harmful
+    if loss_mask is not None:
+        if loss_mask.shape != ppo_kl.shape:
+            raise ValueError(f"M2PO expected loss_mask shape {ppo_kl.shape}, got {loss_mask.shape}.")
+        harmful &= loss_mask.to(dtype=torch.bool)
+    return ppo_kl[harmful].pow(2)
 
 
+@torch.no_grad()
 def kpo_clip_harmful_tokens(
-    ppo_kl: torch.Tensor, advantages: torch.Tensor, kl2_budget: float
-) -> tuple[float, float, float, float]:
-    tr_delta_sq = _get_trust_region_delta_sq(ppo_kl, advantages)
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    kl2_budget: float,
+    loss_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    tr_delta_sq = _get_trust_region_delta_sq(ppo_kl, advantages, loss_mask)
     n = tr_delta_sq.numel()
+    # The legacy implementation converted the input-dtype reduction to a
+    # Python float before comparing it with the budget. Keep that precision on
+    # device so boundary decisions remain unchanged without a host sync.
+    stats_dtype = _m2po_work_dtype(ppo_kl)
+    zero = ppo_kl.new_zeros((), dtype=stats_dtype)
+    no_clip_high = ppo_kl.new_full((), 100000.0, dtype=stats_dtype)
     if n == 0:
-        return 0.0, 100000.0, 0.0, 0.0
-    M2_now = float(tr_delta_sq.sum().detach().item() / n)
-    if M2_now <= kl2_budget + 1e-12:
-        return 0.0, 100000.0, M2_now, M2_now
+        return zero, no_clip_high, zero, zero
+
+    m2_now = tr_delta_sq.sum().to(dtype=stats_dtype) / n
     sorted_delta2, _ = torch.sort(tr_delta_sq)
-    tau, M2_after = _solve_tau_from_sorted_delta2(sorted_delta2, kl2_budget * float(n))
-    return math.exp(-tau), math.exp(tau), M2_now, M2_after
+    tau, m2_after = _solve_tau_from_sorted_delta2(sorted_delta2, kl2_budget * float(n))
+
+    needs_clipping = m2_now > kl2_budget + 1e-12
+    active_tau = torch.where(needs_clipping, tau, zero)
+    clip_low = torch.where(needs_clipping, torch.exp(-active_tau), zero)
+    clip_high = torch.where(needs_clipping, torch.exp(active_tau), no_clip_high)
+    m2_after = torch.where(needs_clipping, m2_after, m2_now)
+    return clip_low, clip_high, m2_now, m2_after
 
 
 def compute_m2po_loss(
@@ -451,16 +520,20 @@ def compute_m2po_loss(
     kl2_budget: float,
     miniclip_low: float = 0.3,
     miniclip_high: float = 0.5,
-) -> tuple[torch.Tensor, torch.Tensor, float, float, float, float]:
-    clip_low, clip_high, M2_now, M2_after = kpo_clip_harmful_tokens(ppo_kl, advantages, kl2_budget)
-    eps_low = max(1.0 - clip_low, miniclip_low)
-    eps_high = max(clip_high - 1.0, miniclip_high)
+    loss_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    clip_low, clip_high, m2_now, m2_after = kpo_clip_harmful_tokens(ppo_kl, advantages, kl2_budget, loss_mask)
+    eps_low = torch.maximum(1.0 - clip_low, clip_low.new_tensor(miniclip_low))
+    eps_high = torch.maximum(clip_high - 1.0, clip_high.new_tensor(miniclip_high))
     ratio = (-ppo_kl).exp()
     pg_losses1 = -advantages * ratio
-    pg_losses2 = -advantages * ratio.clamp(1.0 - eps_low, 1.0 + eps_high)
+    pg_losses2 = -advantages * ratio.clamp(
+        min=(1.0 - eps_low).to(dtype=ratio.dtype),
+        max=(1.0 + eps_high).to(dtype=ratio.dtype),
+    )
     pg_loss = torch.maximum(pg_losses1, pg_losses2)
     clipfrac = (pg_losses2 > pg_losses1).float()
-    return pg_loss, clipfrac, M2_now, M2_after, eps_low, eps_high
+    return pg_loss, clipfrac, m2_now.float(), m2_after.float(), eps_low.float(), eps_high.float()
 
 
 # ───────────────────────────────────────────────────────────────────────────

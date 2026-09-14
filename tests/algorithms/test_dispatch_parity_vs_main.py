@@ -1,20 +1,18 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""The registry must route each algorithm exactly where main's if/elif did.
+"""The registry must preserve main's routing, except documented correctness
+fixes.
 
-Scope note, because it is easy to over-claim here. `relax/utils/training/
-ppo_utils.py` is byte-identical to main on this branch, so no estimator's or
-policy loss's *maths* changed — every one of them still calls the same function
-object it always did. Feeding both implementations the same tensors and
-comparing outputs would therefore pass by construction and prove nothing.
+The referenced numerical kernels are unchanged from main apart from M2PO's
+new loss-mask input. M2PO also intentionally restores the GRPO reward
+normalisation that main's old name whitelist omitted; both deviations are
+pinned separately below and in ``test_policy_loss_dispatch.py``.
 
 What the refactor did change is *routing*: which kernel each algorithm name
 resolves to, and which capability flags gate the surrounding code. That is what
 these tables pin down. They are transcribed from
-main @ 4899b8f3a90489840a736897b4c341d87c6267cf, whose algorithm code last
-changed in 98a72349c7d0368440eb6b0c6849e9d0f2ba8cef ("实现 RLOO advantage
-estimator", #205) -- nothing between those two commits touched advantages.py,
-loss.py, utils.py or ppo_utils.py:
+main @ 5cec8ca1569801d835a56ac86af19babd83caa82. M2PO arrived there in
+9b0c09c78aff603fca84359e9f59c19e146f9116 while this registry PR was open.
 
     relax/components/advantages.py      lines 176-218 (advantage if/elif)
     relax/backends/megatron/loss.py     lines 579-628 (the duplicate of it)
@@ -42,7 +40,7 @@ from relax.algorithms.rewards import REWARD_NORMALIZERS  # noqa: E402
 from relax.utils.training import ppo_utils  # noqa: E402
 
 
-MAIN_SHA = "4899b8f3a90489840a736897b4c341d87c6267cf"  # the base this branch is rebased on
+MAIN_SHA = "5cec8ca1569801d835a56ac86af19babd83caa82"
 
 # main advantages.py:176 — `if estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]`
 # -> get_grpo_returns, etc.
@@ -51,6 +49,7 @@ MAIN_ADVANTAGE_KERNEL = {
     "gspo": ppo_utils.get_grpo_returns,
     "sapo": ppo_utils.get_grpo_returns,
     "cispo": ppo_utils.get_grpo_returns,
+    "m2po": ppo_utils.get_grpo_returns,
     "rloo": ppo_utils.get_grpo_returns,
     "ppo": ppo_utils.get_advantages_and_returns_batch,
     "reinforce_plus_plus": ppo_utils.get_reinforce_plus_plus_returns,
@@ -63,6 +62,7 @@ MAIN_POLICY_KERNEL = {
     "gspo": ppo_utils.compute_policy_loss,
     "sapo": ppo_utils.compute_sapo_loss,
     "cispo": ppo_utils.compute_cispo_loss,
+    "m2po": ppo_utils.compute_m2po_loss,
     "rloo": ppo_utils.compute_rloo_loss,
     "ppo": ppo_utils.compute_policy_loss,
     "reinforce_plus_plus": ppo_utils.compute_policy_loss,
@@ -86,6 +86,8 @@ MAIN_REQUIRES_NORMALIZE_ADVANTAGES = {"reinforce_plus_plus", "reinforce_plus_plu
 # leave-one-out baseline deliberately keeps the reward scale.
 MAIN_GROUP_NORMALIZED = {"grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"}
 MAIN_GROUP_STD_NORMALIZED = {"grpo", "gspo", "sapo", "cispo"}
+INTENDED_GROUP_NORMALIZED = MAIN_GROUP_NORMALIZED | {"m2po"}
+INTENDED_GROUP_STD_NORMALIZED = MAIN_GROUP_STD_NORMALIZED | {"m2po"}
 
 # main loss.py:691-694 and 851-854 — the two duplicated REINFORCE++ name sets
 # that drove `distributed_masked_normalize` and the mask-safe loss reducer.
@@ -145,10 +147,15 @@ def test_requires_normalize_advantages_matches_main(name):
 
 @pytest.mark.parametrize("name", MAIN_ALGORITHMS)
 def test_group_normalization_matches_main(name):
-    """utils.py had two overlapping whitelists; both are now spec fields."""
+    """Preserve main except its documented M2PO whitelist omission."""
     normalizer = get_algorithm(name).reward_normalizer
-    assert (normalizer != "none") is (name in MAIN_GROUP_NORMALIZED)
-    assert (normalizer == "group_mean_std") is (name in MAIN_GROUP_STD_NORMALIZED)
+    assert (normalizer != "none") is (name in INTENDED_GROUP_NORMALIZED)
+    assert (normalizer == "group_mean_std") is (name in INTENDED_GROUP_STD_NORMALIZED)
+
+
+def test_m2po_restores_the_grpo_reward_stage_missing_from_main_wiring():
+    assert "m2po" not in MAIN_GROUP_NORMALIZED
+    assert get_algorithm("m2po").reward_normalizer == "group_mean_std"
 
 
 @pytest.mark.parametrize("name", MAIN_ALGORITHMS)
@@ -181,8 +188,11 @@ def test_no_algorithm_both_requires_and_forbids_advantage_normalization():
 def test_every_algorithm_main_supported_is_still_registered():
     """A migration that quietly dropped an algorithm would pass every other
     test."""
-    missing = set(MAIN_ALGORITHMS) - set(list_algorithm_names())
-    assert not missing, f"{missing} were reachable on main {MAIN_SHA[:7]} and are gone now"
+    actual = set(list_algorithm_names())
+    expected = set(MAIN_ALGORITHMS)
+    assert actual == expected, (
+        f"registry drift from main {MAIN_SHA[:7]}: missing={expected - actual}, extra={actual - expected}"
+    )
 
 
 def test_reward_normalizer_identifiers_all_resolve():
@@ -219,12 +229,15 @@ def _args(estimator, **overrides):
         eps_clip_high=0.3,
         sapo_tau_pos=1.0,
         sapo_tau_neg=1.05,
+        m2po_kl2_budget=0.01,
+        m2po_miniclip_low=0.3,
+        m2po_miniclip_high=0.5,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
 
 
-@pytest.mark.parametrize("name", ["grpo", "gspo", "sapo", "cispo"])
+@pytest.mark.parametrize("name", ["grpo", "gspo", "sapo", "cispo", "m2po", "rloo"])
 def test_grpo_family_adapter_is_the_bare_kernel(name):
     """main: torch.tensor(rewards, float32, device) then get_grpo_returns(...)."""
     from relax.algorithms.advantages import compute_advantages_and_returns
@@ -304,6 +317,34 @@ def test_cispo_adapter_passes_mains_arguments():
         log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages, eps_clip=0.15, eps_clip_high=9.0
     )
     assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+
+
+def test_m2po_adapter_passes_mains_arguments_and_scalar_metrics():
+    from relax.algorithms.policy import compute_policy_loss_for
+
+    log_probs, ppo_kl, advantages = _loss_inputs()
+    args = _args("m2po", m2po_kl2_budget=0.02, m2po_miniclip_low=0.25, m2po_miniclip_high=0.4)
+    loss_mask = torch.ones_like(ppo_kl)
+    got_loss, got_clipfrac, got_metrics = compute_policy_loss_for(
+        args,
+        log_probs=log_probs,
+        ppo_kl=ppo_kl,
+        advantages=advantages,
+        loss_masks=[loss_mask],
+    )
+    want_loss, want_clipfrac, *want_metrics = ppo_utils.compute_m2po_loss(
+        ppo_kl,
+        advantages,
+        args.m2po_kl2_budget,
+        args.m2po_miniclip_low,
+        args.m2po_miniclip_high,
+    )
+
+    assert torch.equal(got_loss, want_loss)
+    assert torch.equal(got_clipfrac, want_clipfrac)
+    assert list(got_metrics) == list(get_algorithm("m2po").policy_scalar_metric_names)
+    for got, want in zip(got_metrics.values(), want_metrics, strict=True):
+        assert torch.equal(got, torch.as_tensor(want, device=ppo_kl.device))
 
 
 @pytest.fixture
@@ -486,13 +527,14 @@ def test_rloo_policy_loss_adapter_is_the_bare_kernel():
     torch.manual_seed(0)
     log_probs, ppo_kl, advantages = torch.randn(8), torch.randn(8), torch.randn(8)
 
-    got_loss, got_clipfrac = compute_policy_loss_for(
+    got_loss, got_clipfrac, got_metrics = compute_policy_loss_for(
         _args("rloo"), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages
     )
     want_loss, want_clipfrac = ppo_utils.compute_rloo_loss(log_probs=log_probs, advantages=advantages)
 
     assert torch.equal(got_loss, want_loss)
     assert torch.equal(got_clipfrac, want_clipfrac)
+    assert got_metrics == {}
 
 
 def test_rloo_policy_loss_ignores_ppo_kl():
@@ -502,13 +544,14 @@ def test_rloo_policy_loss_ignores_ppo_kl():
 
     torch.manual_seed(0)
     log_probs, advantages = torch.randn(8), torch.randn(8)
-    first, _ = compute_policy_loss_for(
+    first, _, first_metrics = compute_policy_loss_for(
         _args("rloo"), log_probs=log_probs, ppo_kl=torch.zeros(8), advantages=advantages
     )
-    second, _ = compute_policy_loss_for(
+    second, _, second_metrics = compute_policy_loss_for(
         _args("rloo"), log_probs=log_probs, ppo_kl=torch.full((8,), 5.0), advantages=advantages
     )
     assert torch.equal(first, second)
+    assert first_metrics == second_metrics == {}
 
 
 def test_rloo_advantage_adapter_is_the_grpo_broadcast():
