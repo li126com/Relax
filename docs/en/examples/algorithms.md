@@ -293,11 +293,14 @@ where $r_t = \exp(-\text{KL}_t)$ and $\text{KL}_t = \log\pi_{\theta_\text{old}}(
 
 $$M_2 = \frac{1}{|\mathcal{H}|} \sum_{t \in \mathcal{H}} (\log r_t)^2$$
 
-Relax solves this statistic independently for each Megatron microbatch. The
-reported `train/ppo_kl_m2_before` and `train/ppo_kl_m2_after` values are therefore
-token- or sample-weighted averages of those local statistics, not a pooled
-moment over every harmful token in the full global batch. They are diagnostics
-only and do not feed back into the loss.
+Relax solves this statistic independently on each Megatron microbatch's local
+tokens. Logging preserves the existing aggregation: with
+`--calculate-per-token-loss`, `train/ppo_kl_m2_before` and
+`train/ppo_kl_m2_after` are weighted by the microbatch's loss-token count;
+otherwise, each microbatch scalar is summed unchanged and the framework
+divides by the sample count. The latter is not a sample-weighted mean. Neither
+mode pools all harmful tokens in the global batch. These logged diagnostics
+do not feed back into the loss.
 
 - If $M_2 \le$ `kl2_budget`: no clipping, all tokens are kept;
 - Otherwise, use water-filling to select the previous observed breakpoint. This gives a conservative trust-region radius $\tau$ whose capped sum does not exceed $|\mathcal{H}| \cdot \text{kl2\_budget}$, yielding the clip band $[e^{-\tau},\ e^{\tau}]$.
@@ -310,18 +313,23 @@ The final clipping margin is $\varepsilon = \max(\text{adaptive value},\ \text{m
 |-----------|---------|-------------|-------------|
 | `--advantage-estimator m2po` | — | — | Enable M2PO |
 | `--m2po-kl2-budget` | `0.01` | `0.01`–`0.04` | Second-moment budget per harmful token. Smaller = tighter/more-frequent clipping, larger = more off-policy tolerance (the paper uses `0.04`) |
-| `--m2po-miniclip-low` | `0.3` | `0.2` | Lower-side clip-margin floor in `[0, 1]` (the margin is at least `miniclip_low`) |
+| `--m2po-miniclip-low` | `0.3` | `0.2` | Lower-side clip-margin floor (the margin is at least `miniclip_low`) |
 | `--m2po-miniclip-high` | `0.5` | `0.28` | Upper clip-margin floor |
 | `--use-rollout-logprobs` | off | on for stale async data | Use the behavior-policy log probabilities that generated each token as M2PO's old policy |
 | `--use-tis` | off | off with rollout log probs | TIS is a post-loss correction and does not drive M2PO's adaptive threshold; it is mutually exclusive with `--use-rollout-logprobs` |
 
 > M2PO derives its clip bounds adaptively, so it does **not** use `--eps-clip` / `--eps-clip-high`.
 
-::: warning Context parallelism
-M2PO currently requires `--context-parallel-size 1` with dynamic context
-parallelism disabled. Its adaptive threshold is defined over the complete
-response; Relax rejects CP-sharded runs at startup until that statistic has a
-cross-CP implementation.
+::: warning Existing implementation behavior
+The registry refactor preserves M2PO's existing computation: reward processing
+passes through raw sample rewards, and the threshold solver does not filter
+tokens by the loss mask or aggregate its statistic across CP ranks. Its
+breakpoint comparisons still use host scalars. Registration does not establish
+equivalence to the paper. Because the clipping statistics are local, M2PO
+declares `supports_context_parallel=False`: startup requires
+`--context-parallel-size 1` and dynamic context parallelism disabled. This
+validation leaves the algorithm's reward, solver and metric calculations
+unchanged.
 :::
 
 ### When to Use
@@ -367,7 +375,7 @@ M2PO_ARGS=(
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
 | **SAPO** | Group-relative reward | Sigmoid gate | Temperature-controlled |
-| **M2PO** | Group-relative reward | Adaptive second-moment clip | Optional KL loss (favor for large-staleness / off-policy) |
+| **M2PO** | Raw sample reward broadcast to tokens | Adaptive second-moment clip | Optional KL loss (favor for large-staleness / off-policy) |
 | **RLOO** | Leave-one-out baseline | Unclipped REINFORCE | Optional KL loss (same as GRPO) |
 
 ## Next Steps

@@ -12,9 +12,6 @@ import pytest
 
 
 ARGS_PATH = pathlib.Path(__file__).resolve().parents[2] / "relax" / "utils" / "arguments.py"
-M2PO_ASYNC_SCRIPT = (
-    pathlib.Path(__file__).resolve().parents[2] / "scripts" / "training" / "text" / "run-qwen3-4B-8xgpu-m2po-async.sh"
-)
 
 
 @pytest.fixture()
@@ -342,54 +339,67 @@ def test_other_estimators_are_unaffected_by_fully_async(arguments_module, estima
     arguments_module.validate_algorithm_args(args)
 
 
-def test_m2po_accepts_context_parallel_size_one(arguments_module):
+@pytest.mark.parametrize("estimator", ["m2po", "reinforce_plus_plus", "reinforce_plus_plus_baseline"])
+def test_cp_limited_algorithms_accept_unsharded_responses(arguments_module, estimator):
     arguments_module.validate_algorithm_args(
-        _args("m2po", context_parallel_size=1, dynamic_context_parallel=False, reward_key=None)
+        _args(
+            estimator,
+            context_parallel_size=1,
+            dynamic_context_parallel=False,
+            normalize_advantages=True,
+            reward_key=None,
+        )
     )
 
 
-def test_m2po_rejects_static_context_parallel_sharding(arguments_module):
-    with pytest.raises(ValueError, match="context-parallel-size 1"):
+@pytest.mark.parametrize("estimator", ["m2po", "reinforce_plus_plus", "reinforce_plus_plus_baseline"])
+@pytest.mark.parametrize(("cp_size", "dynamic_cp"), [(2, False), (1, True)])
+def test_cp_limited_algorithms_reject_static_and_dynamic_sharding(arguments_module, estimator, cp_size, dynamic_cp):
+    with pytest.raises(ValueError, match="context-parallel-size 1.*dynamic-context-parallel disabled"):
         arguments_module.validate_algorithm_args(
-            _args("m2po", context_parallel_size=2, dynamic_context_parallel=False, reward_key=None)
+            _args(
+                estimator,
+                context_parallel_size=cp_size,
+                dynamic_context_parallel=dynamic_cp,
+                normalize_advantages=True,
+                reward_key=None,
+            )
         )
 
 
-def test_m2po_rejects_dynamic_context_parallel_sharding(arguments_module):
-    with pytest.raises(ValueError, match="dynamic-context-parallel disabled"):
-        arguments_module.validate_algorithm_args(
-            _args("m2po", context_parallel_size=1, dynamic_context_parallel=True, reward_key=None)
-        )
+@pytest.mark.parametrize(("cp_size", "dynamic_cp"), [(2, False), (1, True)])
+def test_cp_capable_algorithm_keeps_parallel_configurations(arguments_module, cp_size, dynamic_cp):
+    arguments_module.validate_algorithm_args(
+        _args("grpo", context_parallel_size=cp_size, dynamic_context_parallel=dynamic_cp)
+    )
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "expected"),
+    ("body", "estimator", "cp_size"),
     [
-        pytest.param("m2po_kl2_budget", -0.01, "kl2-budget", id="negative-budget"),
-        pytest.param("m2po_kl2_budget", float("nan"), "kl2-budget", id="nan-budget"),
-        pytest.param("m2po_kl2_budget", float("inf"), "kl2-budget", id="infinite-budget"),
-        pytest.param("m2po_miniclip_low", -0.01, "miniclip-low", id="negative-low-floor"),
-        pytest.param("m2po_miniclip_low", 1.01, "miniclip-low", id="low-floor-above-one"),
-        pytest.param("m2po_miniclip_high", -0.01, "miniclip-high", id="negative-high-floor"),
-        pytest.param("m2po_miniclip_high", float("nan"), "miniclip-high", id="nan-high-floor"),
+        ("context_parallel_size: 2\n", "m2po", 1),
+        ("dynamic_context_parallel: true\n", "m2po", 1),
+        ("advantage_estimator: m2po\n", "grpo", 2),
     ],
 )
-def test_m2po_rejects_invalid_policy_bounds(arguments_module, field, value, expected):
-    with pytest.raises(ValueError, match=expected):
-        arguments_module.validate_algorithm_args(_args("m2po", reward_key=None, **{field: value}))
+def test_yaml_cannot_bypass_m2po_context_parallel_limit(arguments_module, tmp_path, body, estimator, cp_size):
+    args = _overridable_args(tmp_path, body, advantage_estimator=estimator, context_parallel_size=cp_size)
+    with pytest.raises(ValueError, match="context-parallel-size 1.*dynamic-context-parallel disabled"):
+        arguments_module.apply_custom_config_overrides(args)
 
 
-def test_m2po_policy_bounds_do_not_constrain_other_policy_losses(arguments_module):
-    arguments_module.validate_algorithm_args(_args("grpo", reward_key=None, m2po_miniclip_low=2.0))
-
-
-def test_m2po_async_script_uses_the_stale_rollout_policy_for_its_ratio():
-    src = M2PO_ASYNC_SCRIPT.read_text(encoding="utf-8")
-    assert "\n   --use-rollout-logprobs\n" in src
-    assert "\n   --use-tis\n" not in src
-    assert '"actor_fwd": [1, 2]' in src, "the current fully-async service graph still requires actor_fwd"
-    assert "--num-iters-per-train-update 4" in src, "async transfer size must contain at least one prompt group"
-    assert "--clearml-key-filter" not in src, "unknown CLI options are silently ignored"
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"m2po_kl2_budget": 0.0},
+        {"m2po_miniclip_low": 1.2},
+        {"m2po_miniclip_high": 0.0},
+    ],
+)
+def test_m2po_registration_preserves_mains_numeric_config_validation(arguments_module, overrides):
+    """Retain previously accepted parameters without adding algorithm
+    constraints."""
+    arguments_module.validate_algorithm_args(_args("m2po", reward_key=None, **overrides))
 
 
 # ---------------- a YAML global_batch_size must not be derived over ----------------

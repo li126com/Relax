@@ -91,14 +91,15 @@ def _batch(old_log_probs, advantages):
 
 
 @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
-def test_m2po_scalar_metrics_use_the_framework_denominator(monkeypatch, calculate_per_token_loss):
-    """One scalar per microbatch must not shrink after global aggregation."""
+def test_m2po_scalar_metrics_preserve_legacy_denominator_and_mask_semantics(monkeypatch, calculate_per_token_loss):
+    """Masks reduce losses, while the legacy M2 budget includes every token."""
     from relax.algorithms import get_algorithm
     from relax.utils.training.ppo_utils import compute_m2po_loss
 
-    log_probs = torch.tensor([-0.5, -1.2, -0.8, -1.1, -0.6])
-    old_log_probs = torch.full_like(log_probs, -1.0)
-    advantages = torch.tensor([1.0, 1.0, -1.0, -1.0, -1.0])
+    ppo_kl = torch.tensor([-0.4, -0.1, 0.2, -5.0, 0.7])
+    old_log_probs = torch.full_like(ppo_kl, -6.0)
+    log_probs = old_log_probs - ppo_kl
+    advantages = torch.tensor([1.0, 1.0, -1.0, 1.0, -1.0])
     batch = _batch(old_log_probs, advantages)
     _stub_policy_forward(monkeypatch, log_probs)
 
@@ -109,23 +110,42 @@ def test_m2po_scalar_metrics_use_the_framework_denominator(monkeypatch, calculat
         logits=torch.empty(1, 1, 1),
     )
 
-    _, _, *raw_metrics = compute_m2po_loss(
+    raw_loss, raw_clipfrac, *raw_metrics = compute_m2po_loss(
         old_log_probs - log_probs,
         advantages,
         0.01,
         0.3,
         0.5,
-        loss_mask=torch.cat(batch["loss_masks"]),
     )
     logged = dict(zip(logging["keys"], logging["values"][1:], strict=True))
     metric_names = get_algorithm("m2po").policy_scalar_metric_names
-    framework_denominator = torch.cat(batch["loss_masks"]).sum() if calculate_per_token_loss else 2
+    mask = torch.cat(batch["loss_masks"])
+    metric_scale = mask.sum() if calculate_per_token_loss else 1
 
     if calculate_per_token_loss:
-        assert torch.equal(normalizer, framework_denominator)
+        assert torch.equal(normalizer, mask.sum())
     for name, raw in zip(metric_names, raw_metrics, strict=True):
-        assert torch.equal(logged[name], torch.as_tensor(raw) * framework_denominator)
-        assert torch.equal(logged[name] / framework_denominator, torch.as_tensor(raw))
+        assert torch.equal(logged[name], torch.as_tensor(raw) * metric_scale)
+
+    if calculate_per_token_loss:
+        expected_pg_loss = (raw_loss * mask).sum()
+        expected_clipfrac = (raw_clipfrac * mask).sum()
+    else:
+        expected_pg_loss = sum(
+            (values * sample_mask).sum() / sample_mask.sum()
+            for values, sample_mask in zip(raw_loss.split([2, 3]), batch["loss_masks"], strict=True)
+        )
+        expected_clipfrac = sum(
+            (values * sample_mask).sum() / sample_mask.sum()
+            for values, sample_mask in zip(raw_clipfrac.split([2, 3]), batch["loss_masks"], strict=True)
+        )
+    torch.testing.assert_close(logged["pg_loss"], expected_pg_loss)
+    torch.testing.assert_close(logged["pg_clipfrac"], expected_clipfrac)
+
+    _, _, valid_only_m2, *_ = compute_m2po_loss(
+        (old_log_probs - log_probs)[mask.bool()], advantages[mask.bool()], 0.01, 0.3, 0.5
+    )
+    assert raw_metrics[0] > valid_only_m2
 
 
 def test_policy_scalar_metrics_cannot_overwrite_core_metrics(monkeypatch):
@@ -159,12 +179,15 @@ def test_policy_scalar_metrics_cannot_overwrite_core_metrics(monkeypatch):
 @pytest.mark.parametrize(
     ("calculate_per_token_loss", "expected"),
     [
-        pytest.param(False, (100.0 + 1.0) / 2, id="sample-weighted"),
+        pytest.param(False, (100.0 + 1.0) / 3, id="legacy-sample-denominator"),
         pytest.param(True, (100 * 100.0 + 10 * 1.0) / 110, id="token-weighted"),
     ],
 )
-def test_m2po_metrics_are_weighted_local_microbatch_statistics(monkeypatch, calculate_per_token_loss, expected):
-    """Document that M2 diagnostics are not pooled by harmful-token count."""
+def test_m2po_metrics_preserve_legacy_aggregation_with_unequal_microbatches(
+    monkeypatch, calculate_per_token_loss, expected
+):
+    """Sample-mode scalar numerators are not multiplied by local sample
+    count."""
     local_m2_values = iter((100.0, 1.0))
 
     def fake_policy_loss(*_args, **kwargs):
@@ -173,19 +196,20 @@ def test_m2po_metrics_are_weighted_local_microbatch_statistics(monkeypatch, calc
 
     monkeypatch.setattr(loss_module, "compute_policy_loss_for", fake_policy_loss)
     args = _args(calculate_per_token_loss=calculate_per_token_loss)
+    args.global_batch_size = 3
     metric_numerators = []
     token_denominator = 0
 
-    for response_length in (100, 10):
-        log_probs = torch.zeros(response_length)
+    for response_lengths in ([50, 50], [10]):
+        log_probs = torch.zeros(sum(response_lengths))
         _stub_policy_forward(monkeypatch, log_probs)
         batch = {
-            "advantages": torch.ones(response_length),
-            "log_probs": [torch.zeros(response_length)],
-            "response_lengths": [response_length],
-            "total_lengths": [response_length + 1],
-            "unconcat_tokens": [torch.arange(response_length + 1)],
-            "loss_masks": [torch.ones(response_length)],
+            "advantages": torch.ones_like(log_probs),
+            "log_probs": [torch.zeros_like(log_probs)],
+            "response_lengths": response_lengths,
+            "total_lengths": [length + 1 for length in response_lengths],
+            "unconcat_tokens": [torch.arange(length + 1) for length in response_lengths],
+            "loss_masks": [torch.ones(length) for length in response_lengths],
             "dynamic_cp_size": 1,
             "dynamic_cp_rank": 0,
         }
@@ -197,7 +221,7 @@ def test_m2po_metrics_are_weighted_local_microbatch_statistics(monkeypatch, calc
         )
         metric_index = logging["keys"].index("ppo_kl_m2_before") + 1
         metric_numerators.append(logging["values"][metric_index])
-        token_denominator += response_length
+        token_denominator += sum(response_lengths)
 
     denominator = token_denominator if calculate_per_token_loss else args.global_batch_size
     actual = torch.stack(metric_numerators).sum().item() / denominator

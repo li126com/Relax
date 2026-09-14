@@ -86,8 +86,9 @@ def test_returns_raw_and_normalized():
     assert abs(sum(normalized)) < 1e-5
 
 
-def test_identity_path_returns_raw_twice():
-    args = _args("reinforce_plus_plus")
+@pytest.mark.parametrize("estimator", ["ppo", "reinforce_plus_plus", "m2po"])
+def test_identity_path_returns_raw_twice(estimator):
+    args = _args(estimator)
     samples = [_Sample(0, r) for r in (0.0, 1.0, 2.0, 3.0)]
     raw, normalized = utils_mod.post_process_rewards(args, samples)
     assert normalized is raw

@@ -55,21 +55,20 @@ def test_grpo_family_shares_one_advantage_fn():
 
 
 def test_reward_normalizer_ids_match_current_behavior():
-    for name in ("grpo", "gspo", "sapo", "cispo", "m2po"):
+    for name in ("grpo", "gspo", "sapo", "cispo"):
         assert get_algorithm(name).reward_normalizer == "group_mean_std"
     assert get_algorithm("reinforce_plus_plus_baseline").reward_normalizer == "group_mean"
     assert get_algorithm("rloo").reward_normalizer == "group_leave_one_out"
-    for name in ("ppo", "reinforce_plus_plus"):
+    for name in ("ppo", "reinforce_plus_plus", "m2po"):
         assert get_algorithm(name).reward_normalizer == "none"
 
 
-def test_is_group_normalized_matches_the_intended_reward_scope():
+def test_is_group_normalized_matches_mains_reward_scope():
     intended = {
         "grpo",
         "gspo",
         "sapo",
         "cispo",
-        "m2po",
         "rloo",
         "reinforce_plus_plus_baseline",
     }
@@ -130,7 +129,19 @@ def test_defaults_are_permissive():
     assert spec.supports_context_parallel is True
 
 
-def test_m2po_declares_its_scalar_metrics_and_cp_limit():
+def test_context_parallel_support_matches_current_algorithm_constraints():
+    unsupported = {name for name in MAIN_ALGORITHM_NAMES if not get_algorithm(name).supports_context_parallel}
+    assert unsupported == {"m2po", "reinforce_plus_plus", "reinforce_plus_plus_baseline"}
+
+
+def test_m2po_cp_limit_is_independent_of_reward_grouping():
+    spec = get_algorithm("m2po")
+    assert not spec.supports_context_parallel
+    assert spec.reward_normalizer == "none"
+    assert not spec.requires_complete_reward_groups
+
+
+def test_m2po_declares_its_scalar_metrics():
     spec = get_algorithm("m2po")
     assert spec.policy_scalar_metric_names == (
         "ppo_kl_m2_before",
@@ -138,12 +149,6 @@ def test_m2po_declares_its_scalar_metrics_and_cp_limit():
         "m2po_eps_low",
         "m2po_eps_high",
     )
-    assert spec.supports_context_parallel is False
-
-
-def test_context_parallel_support_matches_current_kernel_constraints():
-    unsupported = {name for name in MAIN_ALGORITHM_NAMES if not get_algorithm(name).supports_context_parallel}
-    assert unsupported == {"m2po", "reinforce_plus_plus", "reinforce_plus_plus_baseline"}
 
 
 @pytest.mark.parametrize("metric_names", [("",), ("duplicate", "duplicate")])

@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 from relax.algorithms import get_algorithm
 from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
 from relax.algorithms.policy import compute_policy_loss_for
+from relax.algorithms.spec import ALGORITHM_SPECS
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -944,12 +945,7 @@ def policy_loss_function(
         log_probs=log_probs,
         ppo_kl=ppo_kl,
         advantages=advantages,
-        loss_masks=batch["loss_masks"],
     )
-    policy_scalar_metrics = {
-        name: sum_of_sample_mean(value.expand_as(ppo_kl)).clone().detach()
-        for name, value in policy_scalar_metrics.items()
-    }
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -1494,6 +1490,15 @@ def loss_function(
         )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    # Preserve the pre-registry scalar logging convention: only per-token
+    # aggregation compensates for the framework's token denominator.
+    if args.calculate_per_token_loss:
+        algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
+        if algorithm is not None:
+            for key in algorithm.policy_scalar_metric_names:
+                if key in log:
+                    log[key] = log[key] * num_tokens
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding or all-masked). Without this, gradient doesn't flow through their attention

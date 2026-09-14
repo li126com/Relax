@@ -64,8 +64,10 @@ Edit `ALGORITHM_SPECS` in `relax/algorithms/spec.py`:
 ```
 
 If your algorithm is identical to an existing one at some stage, reuse that
-identifier. GRPO, GSPO, SAPO, CISPO, M2PO and RLOO are equivalent at the
-advantage layer, so all six share `"grpo_broadcast"`.
+identifier. GRPO, GSPO, SAPO, CISPO, M2PO and RLOO all broadcast the scalar
+reward at the advantage layer, so they share `"grpo_broadcast"`. Their reward
+preprocessing differs: M2PO keeps `reward_normalizer="none"` to preserve its
+existing behavior.
 
 Capability fields:
 
@@ -74,7 +76,7 @@ Capability fields:
 | `requires_complete_reward_groups` | Preserve complete prompt groups during debug subsampling when reward processing relies on group-level statistics; currently consumed by debug-data selection |
 | `kl_level` | `"token"` or `"sequence"` (GSPO constrains the sequence) |
 | `needs_full_log_probs` | Whether the loss needs CP-gathered full log probs |
-| `supports_context_parallel` | Whether the policy kernel is correct on CP-sharded responses; `False` rejects static and dynamic CP at startup |
+| `supports_context_parallel` | Whether the algorithm's advantage and policy paths support CP-sharded responses; defaults to `True`. `False` rejects static CP sizes other than 1 and enabled dynamic CP at startup |
 | `policy_scalar_metric_names` | Names, in return order, for extra scalar diagnostics produced by the policy adapter |
 | `advantage_normalization` | What `--normalize-advantages` does: `"whiten"` (masked whitening) or `"token_global"` (REINFORCE++'s global token-level normalization, which also switches on the mask-safe loss reducer) |
 | `needs_critic` | Whether a critic service is required; drives `args.use_critic` |
@@ -85,6 +87,13 @@ Capability fields:
 | `forbids_reward_side_kl` | Demand `--kl-coef 0`; there is nowhere to put a reward-side KL term (`--use-kl-loss` is unaffected) |
 | `requires_global_token_loss` | Demand `--calculate-per-token-loss`; the per-sample token-mean reducer would reweight responses by `1 / response_length` |
 | `requires_on_policy_updates` | Rejects five knobs at once: `--fully-async` / `--hybrid`, `--max-staleness != 0`, `--num-steps-per-rollout != 1`, `rollout_batch_size * n_samples != global_batch_size`, and `--partial-rollout` / `--use-dynamic-global-batch-size`. For objectives with no importance-ratio correction |
+
+M2PO and both REINFORCE++ variants declare `supports_context_parallel=False`.
+This describes the whole algorithm, including advantage computation and policy
+loss. It is independent of `requires_complete_reward_groups`, which concerns
+samples sharing a prompt rather than tokens within a response. M2PO keeps
+`requires_complete_reward_groups=False` because its reward stage performs no
+group normalization.
 
 The `validate_*` functions in `relax/utils/arguments.py` consume the startup
 constraint fields. Runtime consumers read the remaining capabilities: reward
@@ -128,20 +137,17 @@ ADVANTAGE_FNS["my_algo"] = advantage_my_algo
 ```
 
 **Policy loss** (`relax/algorithms/policy.py`), signature
-`fn(args, *, log_probs, ppo_kl, advantages, loss_masks) -> (pg_loss,
+`fn(args, *, log_probs, ppo_kl, advantages) -> (pg_loss,
 pg_clipfrac, *scalar_metrics)`. The underlying kernels take different argument
 lists; the adapter normalizes them. Most adapters return only the first two
 values. If yours returns scalar diagnostics, declare their names in
 `policy_scalar_metric_names` in the same order. Each diagnostic must contain
-exactly one value; the shared policy path applies the current sample/token
-reducer before logging it. Real diagnostics are normalized to float32 so one
-adapter cannot promote the distributed logging vector; complex values are
-rejected.
-
-If the policy kernel introduces CLI parameters with a restricted numeric
-domain, add one validator to `POLICY_LOSS_ARG_VALIDATORS`. Validation is looked
-up through `policy_loss_fn`, so every algorithm reusing that kernel inherits the
-same startup checks without another algorithm-name branch.
+exactly one value. Scalar logging preserves the existing M2PO convention:
+sample mode contributes each microbatch scalar unchanged before the framework
+divides by the sample count; token mode first multiplies it by the microbatch's
+token count. This is not a sample-weighted mean of microbatch diagnostics.
+Real diagnostics are normalized to float32 so one adapter cannot promote the
+distributed logging vector; complex values are rejected.
 
 ### 3. Write unit tests
 

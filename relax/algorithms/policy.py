@@ -4,12 +4,11 @@
 
 The kernels in :mod:`relax.utils.training.ppo_utils` take different argument
 lists. These adapters normalise them to ``fn(args, *, log_probs, ppo_kl,
-advantages, loss_masks)`` so the caller can look one up by name instead of
-branching on the algorithm. Adding a variant means adding an adapter and one
-registry entry; no call site changes.
+advantages)`` so the caller can look one up by name instead of branching on the
+algorithm. Adding a variant means adding an adapter and one registry entry; no
+call site changes.
 """
 
-import math
 from typing import Any, Callable
 
 import torch
@@ -30,7 +29,6 @@ def policy_loss_ppo_clip(
     log_probs: torch.Tensor,
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
-    loss_masks: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Standard clipped surrogate objective (GRPO, GSPO, PPO, REINFORCE++)."""
     return compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
@@ -42,7 +40,6 @@ def policy_loss_sapo(
     log_probs: torch.Tensor,
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
-    loss_masks: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Smooth trust region: sigmoid gating instead of a hard clip."""
     return compute_sapo_loss(
@@ -59,7 +56,6 @@ def policy_loss_cispo(
     log_probs: torch.Tensor,
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
-    loss_masks: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Clipped importance ratio that preserves the gradient direction."""
     return compute_cispo_loss(
@@ -77,19 +73,14 @@ def policy_loss_m2po(
     log_probs: torch.Tensor,
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
-    loss_masks: list[torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, float, float, float, float]:
     """Adaptive asymmetric clipping from a harmful-token KL² budget."""
-    if loss_masks is None:
-        raise ValueError("M2PO policy loss requires loss masks so ignored tokens cannot change its clip bounds.")
-    loss_mask = torch.cat(loss_masks, dim=0).to(device=ppo_kl.device)
     return compute_m2po_loss(
         ppo_kl=ppo_kl,
         advantages=advantages,
         kl2_budget=args.m2po_kl2_budget,
         miniclip_low=args.m2po_miniclip_low,
         miniclip_high=args.m2po_miniclip_high,
-        loss_mask=loss_mask,
     )
 
 
@@ -99,7 +90,6 @@ def policy_loss_rloo(
     log_probs: torch.Tensor,
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
-    loss_masks: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unclipped REINFORCE objective: ``-stopgrad(A) * log pi(y)``.
 
@@ -121,40 +111,12 @@ POLICY_LOSS_FNS: dict[str, Callable[..., tuple[Any, ...]]] = {
 }
 
 
-def validate_policy_loss_m2po_args(args: Any) -> None:
-    """Reject M2PO bounds that silently disable or invalidate clipping."""
-    kl2_budget = args.m2po_kl2_budget
-    miniclip_low = args.m2po_miniclip_low
-    miniclip_high = args.m2po_miniclip_high
-
-    if not math.isfinite(kl2_budget) or kl2_budget < 0:
-        raise ValueError("--m2po-kl2-budget must be finite and >= 0.")
-    if not math.isfinite(miniclip_low) or not 0 <= miniclip_low <= 1:
-        raise ValueError("--m2po-miniclip-low must be finite and in [0, 1].")
-    if not math.isfinite(miniclip_high) or miniclip_high < 0:
-        raise ValueError("--m2po-miniclip-high must be finite and >= 0.")
-
-
-POLICY_LOSS_ARG_VALIDATORS: dict[str, Callable[[Any], None]] = {
-    "m2po": validate_policy_loss_m2po_args,
-}
-
-
-def validate_policy_loss_args_for(args: Any) -> None:
-    """Run the argument validator registered for the selected policy loss."""
-    spec = get_algorithm(args.advantage_estimator)
-    validator = POLICY_LOSS_ARG_VALIDATORS.get(spec.policy_loss_fn)
-    if validator is not None:
-        validator(args)
-
-
 def compute_policy_loss_for(
     args: Any,
     *,
     log_probs: torch.Tensor,
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
-    loss_masks: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Dispatch the registered policy loss and name its scalar diagnostics."""
     spec = get_algorithm(args.advantage_estimator)
@@ -163,7 +125,6 @@ def compute_policy_loss_for(
         log_probs=log_probs,
         ppo_kl=ppo_kl,
         advantages=advantages,
-        loss_masks=loss_masks,
     )
     if len(scalar_metric_values) != len(spec.policy_scalar_metric_names):
         raise ValueError(

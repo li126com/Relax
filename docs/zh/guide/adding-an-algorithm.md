@@ -48,7 +48,7 @@ relax/algorithms/
 ),
 ```
 
-如果新算法在某个阶段与已有算法完全一致，直接复用那个标识符即可——例如 GRPO / GSPO / SAPO / CISPO / M2PO / RLOO 在 advantage 层完全等价，六者共享 `"grpo_broadcast"`。
+如果新算法在某个阶段与已有算法完全一致，直接复用那个标识符即可。例如 GRPO / GSPO / SAPO / CISPO / M2PO / RLOO 在 advantage 层都广播标量 reward，因此共享 `"grpo_broadcast"`。它们的 reward 预处理不同：M2PO 保持 `reward_normalizer="none"`，以保留既有行为。
 
 可用的能力字段：
 
@@ -57,7 +57,7 @@ relax/algorithms/
 | `requires_complete_reward_groups` | reward 处理依赖组级统计时，在 debug 子采样中保留完整 prompt 组；目前由 debug 数据选择逻辑消费 |
 | `kl_level` | `"token"` 或 `"sequence"`（GSPO 用序列级） |
 | `needs_full_log_probs` | loss 是否需要 CP all-gather 后的完整 log probs |
-| `supports_context_parallel` | policy kernel 在 CP 切分 response 后是否仍正确；设为 `False` 会在启动时拒绝静态和动态 CP |
+| `supports_context_parallel` | 算法的 advantage 和 policy 路径是否支持 CP 切分的 response；默认为 `True`。设为 `False` 会在启动时拒绝不等于 1 的静态 CP size，以及开启动态 CP 的配置 |
 | `policy_scalar_metric_names` | policy adapter 额外返回的标量诊断项名称，顺序与返回值一致 |
 | `advantage_normalization` | `--normalize-advantages` 的归一化方式：`"whiten"`（掩码白化）或 `"token_global"`（REINFORCE++ 的全局 token 级归一化，同时切换掩码安全的 loss reducer） |
 | `needs_critic` | 是否需要 critic 服务，驱动 `args.use_critic` |
@@ -68,6 +68,8 @@ relax/algorithms/
 | `forbids_reward_side_kl` | 要求 `--kl-coef 0`（reward 侧 KL 项无处可放；`--use-kl-loss` 不受影响） |
 | `requires_global_token_loss` | 强制要求 `--calculate-per-token-loss`（否则按样本取 token 均值，会按 `1 / response_length` 重新加权） |
 | `requires_on_policy_updates` | 一次性拒绝五项：`--fully-async` / `--hybrid`、`--max-staleness != 0`、`--num-steps-per-rollout != 1`、`rollout_batch_size * n_samples != global_batch_size`、`--partial-rollout` / `--use-dynamic-global-batch-size`。适用于没有重要性比值修正的目标函数 |
+
+M2PO 和两个 REINFORCE++ 变体均声明 `supports_context_parallel=False`。它描述整个算法，包括 advantage 计算和 policy loss，与 `requires_complete_reward_groups` 相互独立：后者关注同一 prompt 下的样本组，不是一个 response 内的 token。M2PO 的 reward 阶段没有组归一化，因此仍保持 `requires_complete_reward_groups=False`。
 
 `relax/utils/arguments.py` 的 `validate_*` 函数统一消费启动约束字段。其余能力由运行时消费者读取：reward dispatch 使用 `reward_normalizer`，debug 子采样使用 `requires_complete_reward_groups`，policy 路径使用 KL、归一化、完整 log-probability 与标量指标声明。复用已有能力时只需声明，不要再给这些消费者增加算法名 `if`；只有新增一种前所未有的枚举值或实现时，才需要为该值增加一个通用处理器。
 
@@ -98,9 +100,7 @@ def advantage_my_algo(args, *, rewards, kl, **_unused):
 ADVANTAGE_FNS["my_algo"] = advantage_my_algo
 ```
 
-**Policy loss**（`relax/algorithms/policy.py`），签名 `fn(args, *, log_probs, ppo_kl, advantages, loss_masks) -> (pg_loss, pg_clipfrac, *scalar_metrics)`。底层算子签名不一致，适配器负责统一。大多数 adapter 只返回前两个值；若要额外返回标量诊断项，应按相同顺序在 `policy_scalar_metric_names` 中声明名称。每个诊断项必须恰好包含一个值，共享 policy 路径会在记录前应用当前的 sample/token reducer。实数诊断项会统一转换为 float32，避免单个 adapter 提升整条分布式日志向量的 dtype；复数会被拒绝。
-
-如果 policy kernel 新增的 CLI 参数有数值范围限制，应在 `POLICY_LOSS_ARG_VALIDATORS` 中登记一个 validator。校验通过 `policy_loss_fn` 查找，因此所有复用该 kernel 的算法都会自动继承同一套启动校验，不需要新增算法名分支。
+**Policy loss**（`relax/algorithms/policy.py`），签名 `fn(args, *, log_probs, ppo_kl, advantages) -> (pg_loss, pg_clipfrac, *scalar_metrics)`。底层算子签名不一致，适配器负责统一。大多数 adapter 只返回前两个值；若要额外返回标量诊断项，应按相同顺序在 `policy_scalar_metric_names` 中声明名称。每个诊断项必须恰好包含一个值。标量日志保留 M2PO 的既有约定：sample 模式下直接累加每个 microbatch 的标量，再由框架除以 sample 数；token 模式下先乘以该 microbatch 的 token 数。因此它不是 microbatch 诊断值按 sample 加权的均值。实数诊断项会统一转换为 float32，避免单个 adapter 提升整条分布式日志向量的 dtype；复数会被拒绝。
 
 ### 3. 写单测
 

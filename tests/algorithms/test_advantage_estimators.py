@@ -60,6 +60,15 @@ def test_grpo_accepts_a_tensor_as_well_as_a_list():
     assert torch.equal(from_list[0], from_tensor[0])
 
 
+def test_reward_tensor_conversion_preserves_mains_independent_storage():
+    from relax.algorithms.advantages import _as_reward_tensor
+
+    rewards = torch.tensor([1.5, -2.0])
+    converted = _as_reward_tensor(rewards, _inputs()["kl"])
+    converted[0] = 99.0
+    assert rewards[0] == 1.5
+
+
 def test_grpo_advantages_is_a_distinct_list_from_returns():
     """Legacy did `advantages = list(returns)`; rebinding one must not touch the other."""
     adv, ret = compute_advantages_and_returns(_args("grpo"), rewards=[1.0, 1.0], **_inputs())

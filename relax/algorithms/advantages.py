@@ -9,9 +9,9 @@ means the two call sites differ only in what surrounds them: the pipeline-stage
 early return, in-place write-back versus nested-tensor packing, and the
 optional advantage whitening.
 
-Note that the group-wise reward standardisation happened earlier, on the
-rollout side (see :mod:`relax.algorithms.rewards`).  By the time an estimator
-runs, ``rewards`` already holds one normalised scalar per sample.
+Any group-wise reward standardisation happens earlier, on the rollout side
+(see :mod:`relax.algorithms.rewards`). By the time an estimator runs,
+``rewards`` holds one processed scalar per sample.
 """
 
 from typing import Any, Callable
@@ -29,12 +29,12 @@ from relax.utils.training.ppo_utils import (
 
 def _as_reward_tensor(rewards: Any, kl: list[torch.Tensor]) -> torch.Tensor:
     if isinstance(rewards, torch.Tensor):
-        return rewards.to(dtype=torch.float32, device=kl[0].device)
+        return rewards.detach().to(dtype=torch.float32, device=kl[0].device, copy=True)
     return torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
 
 
 def advantage_grpo_broadcast(args: Any, *, rewards, kl, **_unused):
-    """Broadcast the already group-normalised scalar reward over tokens."""
+    """Broadcast the processed scalar reward over tokens."""
     reward_tensor = _as_reward_tensor(rewards, kl)
     returns = get_grpo_returns(reward_tensor, kl)
     advantages = list(returns)  # separate list so rebinding one does not move the other

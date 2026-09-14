@@ -1,12 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""The registry must preserve main's routing, except documented correctness
-fixes.
+"""The registry must preserve main's routing and numerical behavior.
 
-The referenced numerical kernels are unchanged from main apart from M2PO's
-new loss-mask input. M2PO also intentionally restores the GRPO reward
-normalisation that main's old name whitelist omitted; both deviations are
-pinned separately below and in ``test_policy_loss_dispatch.py``.
+The numerical kernels are unchanged from main. In particular, M2PO retains
+main's raw rewards, unmasked clipping budget and scalar logging convention.
 
 What the refactor did change is *routing*: which kernel each algorithm name
 resolves to, and which capability flags gate the surrounding code. That is what
@@ -86,8 +83,6 @@ MAIN_REQUIRES_NORMALIZE_ADVANTAGES = {"reinforce_plus_plus", "reinforce_plus_plu
 # leave-one-out baseline deliberately keeps the reward scale.
 MAIN_GROUP_NORMALIZED = {"grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"}
 MAIN_GROUP_STD_NORMALIZED = {"grpo", "gspo", "sapo", "cispo"}
-INTENDED_GROUP_NORMALIZED = MAIN_GROUP_NORMALIZED | {"m2po"}
-INTENDED_GROUP_STD_NORMALIZED = MAIN_GROUP_STD_NORMALIZED | {"m2po"}
 
 # main loss.py:691-694 and 851-854 — the two duplicated REINFORCE++ name sets
 # that drove `distributed_masked_normalize` and the mask-safe loss reducer.
@@ -147,15 +142,16 @@ def test_requires_normalize_advantages_matches_main(name):
 
 @pytest.mark.parametrize("name", MAIN_ALGORITHMS)
 def test_group_normalization_matches_main(name):
-    """Preserve main except its documented M2PO whitelist omission."""
+    """Registration must not change the reward stage of any existing
+    algorithm."""
     normalizer = get_algorithm(name).reward_normalizer
-    assert (normalizer != "none") is (name in INTENDED_GROUP_NORMALIZED)
-    assert (normalizer == "group_mean_std") is (name in INTENDED_GROUP_STD_NORMALIZED)
+    assert (normalizer != "none") is (name in MAIN_GROUP_NORMALIZED)
+    assert (normalizer == "group_mean_std") is (name in MAIN_GROUP_STD_NORMALIZED)
 
 
-def test_m2po_restores_the_grpo_reward_stage_missing_from_main_wiring():
+def test_m2po_preserves_mains_raw_reward_stage():
     assert "m2po" not in MAIN_GROUP_NORMALIZED
-    assert get_algorithm("m2po").reward_normalizer == "group_mean_std"
+    assert get_algorithm("m2po").reward_normalizer == "none"
 
 
 @pytest.mark.parametrize("name", MAIN_ALGORITHMS)
@@ -324,13 +320,11 @@ def test_m2po_adapter_passes_mains_arguments_and_scalar_metrics():
 
     log_probs, ppo_kl, advantages = _loss_inputs()
     args = _args("m2po", m2po_kl2_budget=0.02, m2po_miniclip_low=0.25, m2po_miniclip_high=0.4)
-    loss_mask = torch.ones_like(ppo_kl)
     got_loss, got_clipfrac, got_metrics = compute_policy_loss_for(
         args,
         log_probs=log_probs,
         ppo_kl=ppo_kl,
         advantages=advantages,
-        loss_masks=[loss_mask],
     )
     want_loss, want_clipfrac, *want_metrics = ppo_utils.compute_m2po_loss(
         ppo_kl,
@@ -371,6 +365,20 @@ def cp_disabled(monkeypatch):
     monkeypatch.setitem(sys.modules, "megatron", megatron)
     monkeypatch.setitem(sys.modules, "megatron.core", core)
     yield
+
+
+@pytest.mark.parametrize("estimator", ["grpo", "m2po", "reinforce_plus_plus", "reinforce_plus_plus_baseline"])
+def test_tensor_rewards_preserve_mains_detached_advantages(cp_disabled, estimator):
+    from relax.algorithms.advantages import compute_advantages_and_returns
+
+    inputs = dict(kl=_kl(), loss_masks=_masks(), response_lengths=[3, 2], total_lengths=[5, 4])
+    rewards = torch.tensor([1.5, -2.0], requires_grad=True)
+    advantages, returns = compute_advantages_and_returns(_args(estimator), rewards=rewards, **inputs)
+    expected, _ = compute_advantages_and_returns(_args(estimator), rewards=[1.5, -2.0], **inputs)
+    for actual, want in zip(advantages, expected, strict=True):
+        assert torch.equal(actual, want)
+        assert not actual.requires_grad
+    assert all(not value.requires_grad for value in returns)
 
 
 def test_reinforce_plus_plus_adapter_is_the_bare_kernel(cp_disabled):

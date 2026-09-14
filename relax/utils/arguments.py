@@ -1837,22 +1837,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--m2po-kl2-budget",
                 type=float,
                 default=0.01,
-                help=(
-                    "M2PO non-negative finite second-moment budget per harmful token "
-                    "(KL2_budget in paper; paper uses 0.04, default: 0.01)"
-                ),
+                help="M2PO second-moment budget per harmful token (KL2_budget in paper; paper uses 0.04, default: 0.01)",
             )
             parser.add_argument(
                 "--m2po-miniclip-low",
                 type=float,
                 default=0.3,
-                help="M2PO lower clip epsilon floor in [0, 1] (paper default: 0.3)",
+                help="M2PO minimum lower clip epsilon floor (paper default: 0.3)",
             )
             parser.add_argument(
                 "--m2po-miniclip-high",
                 type=float,
                 default=0.5,
-                help="M2PO non-negative finite upper clip epsilon floor (paper default: 0.5)",
+                help="M2PO minimum upper clip epsilon floor (paper default: 0.5)",
             )
             parser.add_argument(
                 "--disable-compute-advantages-and-returns",
@@ -3244,9 +3241,6 @@ def validate_algorithm_args(args) -> None:
     # would otherwise surface as a KeyError deep inside a worker on the first
     # batch. Resolve them here, while the error can still name the culprit.
     _assert_spec_implementations_resolve(spec)
-    from relax.algorithms.policy import validate_policy_loss_args_for
-
-    validate_policy_loss_args_for(args)
 
     args.use_critic = spec.needs_critic
 
@@ -3255,8 +3249,7 @@ def validate_algorithm_args(args) -> None:
     ):
         raise ValueError(
             f"--advantage-estimator {spec.name} currently requires --context-parallel-size 1 "
-            "with --dynamic-context-parallel disabled: its policy statistic must be computed over the full response, "
-            "but responses are CP-sharded."
+            "with --dynamic-context-parallel disabled: its current implementation does not support CP-sharded responses."
         )
 
     if spec.requires_normalize_advantages and not args.normalize_advantages:

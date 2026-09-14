@@ -59,10 +59,10 @@ class AlgorithmSpec:
     """Names for scalar diagnostics returned after loss and clip fraction.
 
     Policy adapters return these values in the same order. The policy caller
-    rejects complex values, normalizes real scalars to float32, broadcasts them
-    over the local response tokens, and applies the standard loss reducer. Thus
-    sample-mean and per-token logging both receive the numerator expected by
-    their generic denominator.
+    rejects complex values and normalizes real scalars to float32. Preserve
+    main's logging convention: one raw scalar per microbatch in sample mode;
+    multiply by the microbatch's token count in per-token mode before the
+    framework aggregates the logging vector.
     """
 
     kl_level: str = "token"
@@ -87,7 +87,11 @@ class AlgorithmSpec:
     """Whether the loss needs CP-gathered full-response log probs."""
 
     supports_context_parallel: bool = True
-    """Whether the policy kernel is correct when a response is CP-sharded."""
+    """Whether the algorithm implementation supports CP-sharded responses.
+
+    False rejects both static CP sharding and dynamic CP at startup. This
+    covers the advantage and policy stages, independently of reward grouping.
+    """
 
     # --- orchestration and validation ---
     needs_critic: bool = False
@@ -223,11 +227,9 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
     ),
     "m2po": AlgorithmSpec(
         name="m2po",
-        # M2PO replaces GRPO's fixed policy clip, not its group-relative
-        # reward advantage. Main omitted this name from its old whitelist;
-        # declaring the intended normalizer here fixes that integration gap.
-        reward_normalizer="group_mean_std",
-        requires_complete_reward_groups=True,
+        # Preserve main's raw reward path; changing the reward baseline is
+        # an algorithm change, independent of registering its policy loss.
+        reward_normalizer="none",
         advantage_fn="grpo_broadcast",
         policy_loss_fn="m2po",
         supports_context_parallel=False,

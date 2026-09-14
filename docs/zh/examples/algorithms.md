@@ -290,7 +290,7 @@ $$\mathcal{H} = \{t : \hat{A}_t > 0,\ r_t > 1\} \cup \{t : \hat{A}_t < 0,\ r_t <
 
 $$M_2 = \frac{1}{|\mathcal{H}|} \sum_{t \in \mathcal{H}} (\log r_t)^2$$
 
-Relax 会在每个 Megatron microbatch 内独立求解该统计量。因此，上报的 `train/ppo_kl_m2_before` 与 `train/ppo_kl_m2_after` 是局部统计量按 token 或 sample 加权后的均值，并非整个 global batch 所有有害 token 合并计算的二阶矩。它们仅用于诊断，不会反馈到 loss。
+Relax 会在每个 Megatron microbatch 的本地 token 上独立求解该统计量。日志保留既有聚合方式：开启 `--calculate-per-token-loss` 时，`train/ppo_kl_m2_before` 与 `train/ppo_kl_m2_after` 按 microbatch 参与 loss 的 token 数加权；否则直接累加各 microbatch 的标量，再由框架除以 sample 数。后者不是按 sample 加权的均值，两种模式也都不是将整个 global batch 所有有害 token 合并计算的二阶矩。这些日志诊断值不会反馈到 loss。
 
 - 若 $M_2 \le$ `kl2_budget`：不裁剪，token 全部保留；
 - 否则用 water-filling 选择前一个已观测到的 breakpoint，得到保守的信任域半径 $\tau$；截顶后的总和不超过 $|\mathcal{H}| \cdot \text{kl2\_budget}$，并据此得到裁剪区间 $[e^{-\tau},\ e^{\tau}]$。
@@ -303,15 +303,15 @@ Relax 会在每个 Megatron microbatch 内独立求解该统计量。因此，�
 |------|--------|--------|------|
 | `--advantage-estimator m2po` | — | — | 启用 M2PO |
 | `--m2po-kl2-budget` | `0.01` | `0.01`~`0.04` | 每个有害 token 的二阶矩预算。越小裁剪越紧/越频繁，越大越容忍 off-policy（论文用 `0.04`） |
-| `--m2po-miniclip-low` | `0.3` | `0.2` | `[0, 1]` 内的下侧裁剪边距地板（边距至少为 `miniclip_low`） |
+| `--m2po-miniclip-low` | `0.3` | `0.2` | 下侧裁剪边距地板（边距至少为 `miniclip_low`） |
 | `--m2po-miniclip-high` | `0.5` | `0.28` | 上方裁剪边距地板 |
 | `--use-rollout-logprobs` | 关闭 | 陈旧异步数据时开启 | 使用实际生成 token 的 behavior-policy log probabilities 作为 M2PO old policy |
 | `--use-tis` | 关闭 | 使用 rollout log probs 时关闭 | TIS 是 policy loss 之后的修正，不会驱动 M2PO 自适应阈值；它与 `--use-rollout-logprobs` 互斥 |
 
 > M2PO 自适应推导裁剪边界，因此**不使用** `--eps-clip` / `--eps-clip-high`。
 
-::: warning Context parallelism
-M2PO 当前要求 `--context-parallel-size 1`，并关闭动态 context parallel。其自适应阈值定义在完整 response 上；在该统计实现跨 CP 汇总前，Relax 会在启动时拒绝 CP 切分的运行。
+::: warning 既有实现行为
+注册表重构保留 M2PO 的既有计算方式：reward 处理直接传递原始样本奖励，阈值求解器不按 loss mask 过滤 token，也不跨 CP rank 汇总统计量；breakpoint 比较仍使用 host 标量。完成注册不代表与论文等价。由于裁剪统计量在本地计算，M2PO 声明 `supports_context_parallel=False`，启动时要求 `--context-parallel-size 1`，并关闭动态 context parallel。该校验保持算法的 reward、求解器和指标计算不变。
 :::
 
 ### 推荐使用场景
@@ -352,7 +352,7 @@ M2PO_ARGS=(
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
 | **SAPO** | 组相对奖励 | Sigmoid 门控 | 温度控制 |
-| **M2PO** | 组相对奖励 | 二阶矩自适应裁剪 | 可选 KL loss（大 staleness / off-policy 场景优先） |
+| **M2PO** | 原始样本奖励广播到 token | 二阶矩自适应裁剪 | 可选 KL loss（大 staleness / off-policy 场景优先） |
 | **RLOO** | Leave-one-out 基线 | 非裁剪 REINFORCE | 可选 KL loss（同 GRPO） |
 
 ## 下一步
