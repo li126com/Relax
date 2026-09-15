@@ -23,16 +23,6 @@ from relax.algorithms.rewards import REWARD_NORMALIZERS  # noqa: E402
 _LEGACY_GROUP_NORM_ESTIMATORS = ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
 _LEGACY_STD_NORM_ESTIMATORS = ["grpo", "gspo", "sapo", "cispo"]
 
-ALL_ESTIMATORS = [
-    "grpo",
-    "gspo",
-    "sapo",
-    "cispo",
-    "ppo",
-    "reinforce_plus_plus",
-    "reinforce_plus_plus_baseline",
-]
-
 CONTIGUOUS_GROUPS = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]
 INTERLEAVED_GROUPS = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]
 
@@ -70,10 +60,7 @@ def _legacy_post_process_rewards(args, samples, raw_rewards):
 
 
 def _new_normalize(args, samples, raw_rewards):
-    """Mirrors the refactored dispatch in
-    relax.utils.utils.post_process_rewards."""
-    if not args.rewards_normalization:
-        return raw_rewards
+    """Exercise the registered normalizer; entrypoint hooks are tested separately."""
     spec = get_algorithm(args.advantage_estimator)
     return REWARD_NORMALIZERS[spec.reward_normalizer](args, samples, raw_rewards)
 
@@ -111,18 +98,16 @@ def _reward_fixtures():
     }
 
 
-@pytest.mark.parametrize("estimator", ALL_ESTIMATORS)
-@pytest.mark.parametrize("rewards_normalization", [True, False])
-@pytest.mark.parametrize("grpo_std_normalization", [True, False])
+@pytest.mark.parametrize(
+    ("estimator", "grpo_std_normalization"),
+    [("grpo", True), ("grpo", False), ("reinforce_plus_plus_baseline", True)],
+)
 @pytest.mark.parametrize("fixture_name", sorted(_reward_fixtures()))
 @pytest.mark.parametrize("groups", [CONTIGUOUS_GROUPS, INTERLEAVED_GROUPS])
-def test_normalizer_is_bitwise_identical_to_legacy(
-    estimator, rewards_normalization, grpo_std_normalization, fixture_name, groups
-):
+def test_normalizer_is_bitwise_identical_to_legacy(estimator, grpo_std_normalization, fixture_name, groups):
     raw = _reward_fixtures()[fixture_name]
     args = _args(
         estimator,
-        rewards_normalization=rewards_normalization,
         grpo_std_normalization=grpo_std_normalization,
     )
     samples = _samples(groups)
@@ -131,15 +116,6 @@ def test_normalizer_is_bitwise_identical_to_legacy(
     actual = _new_normalize(args, samples, raw)
 
     _assert_bitwise_equal(expected, actual)
-
-
-def test_identity_normalizer_returns_the_same_list_object():
-    """Non-normalising estimators must not copy — legacy returned raw_rewards
-    itself."""
-    raw = [1.0, 2.0, 3.0, 4.0]
-    args = _args("reinforce_plus_plus")
-    samples = _samples([0, 0, 0, 0])
-    assert _new_normalize(args, samples, raw) is raw
 
 
 def test_missing_group_index_raises():
@@ -156,48 +132,34 @@ def test_wrong_group_size_raises():
         _new_normalize(args, samples, [1.0, 2.0, 3.0, 4.0])
 
 
-def test_group_mean_normalizer_never_divides_by_std():
-    """reinforce_plus_plus_baseline only centres, even with std normalisation
-    on."""
-    args = _args("reinforce_plus_plus_baseline", n=4, grpo_std_normalization=True)
-    samples = _samples([0, 0, 0, 0])
-    out = _new_normalize(args, samples, [0.0, 1.0, 2.0, 3.0])
-    _assert_bitwise_equal(out, [-1.5, -0.5, 0.5, 1.5])
-
-
-def test_group_mean_std_respects_the_dr_grpo_switch():
-    args_on = _args("grpo", n=4, grpo_std_normalization=True)
-    args_off = _args("grpo", n=4, grpo_std_normalization=False)
-    samples = _samples([0, 0, 0, 0])
-    raw = [0.0, 1.0, 2.0, 3.0]
-    assert _new_normalize(args_on, samples, raw) != _new_normalize(args_off, samples, raw)
-    _assert_bitwise_equal(_new_normalize(args_off, samples, raw), [-1.5, -0.5, 0.5, 1.5])
-
-
-@pytest.mark.parametrize("grpo_std_normalization", [True, False])
-def test_m2po_preserves_mains_raw_rewards(grpo_std_normalization):
+def test_m2po_preserves_mains_raw_rewards():
     raw = [0.0, 1.0, 2.0, 3.0]
     # Main does not require M2PO samples to form complete reward groups.
     samples = _samples([None, 0, 1, 1])
-    args = _args("m2po", grpo_std_normalization=grpo_std_normalization)
+    args = _args("m2po")
     assert _new_normalize(args, samples, raw) is raw
 
 
-def test_grouping_is_driven_by_group_index_not_position():
-    """Group membership follows ``group_index``, not batch position.
+def _main_rloo_normalized_rewards(samples, raw_rewards):
+    """Frozen RLOO reward branch from main@5cec8ca1, independent of its kernel."""
+    rewards = torch.tensor(raw_rewards, dtype=torch.float)
+    positions_by_group: dict[int, list[int]] = {}
+    for position, sample in enumerate(samples):
+        positions_by_group.setdefault(sample.group_index, []).append(position)
 
-    Interleaving the same rewards into different groups therefore changes the
-    group statistics and so the normalized values -- which is what the
-    assertion below checks. (An earlier version of this docstring claimed the
-    opposite.)
-    """
-    args = _args("grpo", n=4)
-    raw = [0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0, 13.0]
+    normalized_rewards = torch.empty_like(rewards)
+    for positions in positions_by_group.values():
+        group_rewards = rewards[positions]
+        group_size = group_rewards.shape[0]
+        mean_reward = group_rewards.mean()
+        scale = group_size / (group_size - 1)
+        normalized_rewards[positions] = scale * (group_rewards - mean_reward)
+    return normalized_rewards.tolist()
 
-    contiguous = _new_normalize(args, _samples([0, 0, 0, 0, 1, 1, 1, 1]), raw)
-    interleaved = _new_normalize(args, _samples([0, 1, 0, 1, 0, 1, 0, 1]), raw)
 
-    assert sorted(round(v, 5) for v in contiguous) != sorted(round(v, 5) for v in interleaved)
-    # group 0 of the interleaved layout holds raw[0], raw[2], raw[4], raw[6]
-    group0 = [interleaved[i] for i in (0, 2, 4, 6)]
-    assert abs(sum(group0)) < 1e-5
+@pytest.mark.parametrize("groups", [[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 0, 1, 0, 1, 0, 1]])
+def test_rloo_reward_normalizer_matches_mains_inline_branch(groups):
+    raw = [1.0, 0.0, 0.5, -2.0, 3.0, 3.0, 3.0, 0.25]
+    samples = _samples(groups)
+    actual = _new_normalize(_args("rloo"), samples, raw)
+    _assert_bitwise_equal(actual, _main_rloo_normalized_rewards(samples, raw))

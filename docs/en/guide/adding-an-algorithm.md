@@ -151,8 +151,9 @@ distributed logging vector; complex values are rejected.
 
 ### 3. Write unit tests
 
-Tests under `tests/algorithms/` need only torch — no megatron, ray or
-transfer_queue:
+Tests under `tests/algorithms/` run on CPU with pytest, torch, NumPy and PyYAML.
+Unrelated training dependencies are isolated in test fixtures; megatron, ray,
+tensordict and transfer_queue are not required:
 
 ```bash
 pytest tests/algorithms/ -v

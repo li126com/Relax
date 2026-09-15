@@ -104,7 +104,8 @@ ADVANTAGE_FNS["my_algo"] = advantage_my_algo
 
 ### 3. 写单测
 
-`tests/algorithms/` 下的测试不依赖 megatron / ray / transfer_queue，只要 torch 就能跑：
+`tests/algorithms/` 下的测试使用 pytest、torch、NumPy 和 PyYAML，即可在 CPU 上运行。
+测试 fixture 隔离了无关的训练依赖，无需安装 megatron、ray、tensordict 或 transfer_queue：
 
 ```bash
 pytest tests/algorithms/ -v

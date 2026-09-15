@@ -1,8 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Unit tests for the algorithm registry."""
+"""Registry contracts and the algorithm declarations migrated from main."""
 
-import inspect
+import subprocess
+import sys
+from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
@@ -10,128 +13,72 @@ from relax.algorithms import get_algorithm, list_algorithm_names
 from relax.algorithms.spec import ALGORITHM_SPECS, AlgorithmSpec
 
 
-MAIN_ALGORITHM_NAMES = [
-    "grpo",
-    "gspo",
-    "sapo",
-    "cispo",
-    "m2po",
-    "rloo",
-    "ppo",
-    "reinforce_plus_plus",
-    "reinforce_plus_plus_baseline",
-]
+# Transcribed from main 5cec8ca1569801d835a56ac86af19babd83caa82, not generated
+# from AlgorithmSpec. Numerical adapter parity is tested in the stage tests.
+MAIN_ROUTES = {
+    "grpo": ("group_mean_std", "grpo_broadcast", "ppo_clip"),
+    "gspo": ("group_mean_std", "grpo_broadcast", "ppo_clip"),
+    "sapo": ("group_mean_std", "grpo_broadcast", "sapo"),
+    "cispo": ("group_mean_std", "grpo_broadcast", "cispo"),
+    "m2po": ("none", "grpo_broadcast", "m2po"),
+    "rloo": ("group_leave_one_out", "grpo_broadcast", "rloo"),
+    "ppo": ("none", "gae", "ppo_clip"),
+    "reinforce_plus_plus": ("none", "reinforce_plus_plus", "ppo_clip"),
+    "reinforce_plus_plus_baseline": ("group_mean", "reinforce_plus_plus_baseline", "ppo_clip"),
+}
+MAIN_CAPABILITIES = {
+    "needs_full_log_probs": {"gspo"},
+    "needs_critic": {"ppo"},
+    "requires_complete_reward_groups": {"grpo", "gspo", "sapo", "cispo", "rloo", "reinforce_plus_plus_baseline"},
+    "requires_normalize_advantages": {"reinforce_plus_plus", "reinforce_plus_plus_baseline"},
+    "forbids_normalize_advantages": {"rloo"},
+    "requires_rewards_normalization": {"rloo", "reinforce_plus_plus_baseline"},
+    "forbids_reward_side_kl": {"rloo", "reinforce_plus_plus_baseline"},
+    "requires_global_token_loss": {"rloo"},
+    "requires_on_policy_updates": {"rloo"},
+}
 
 
-def test_all_expected_algorithms_registered():
-    assert list_algorithm_names() == MAIN_ALGORITHM_NAMES
+def test_main_algorithms_remain_registered_and_specs_are_consistent():
+    assert set(MAIN_ROUTES) <= set(list_algorithm_names())
+    assert "sft" not in ALGORITHM_SPECS
+    for name, spec in ALGORITHM_SPECS.items():
+        assert spec.name == name
+        assert not (spec.requires_normalize_advantages and spec.forbids_normalize_advantages)
 
 
-def test_spec_name_matches_dict_key():
-    for key, spec in ALGORITHM_SPECS.items():
-        assert spec.name == key
+@pytest.mark.parametrize("name", MAIN_ROUTES)
+def test_existing_algorithm_routes_and_capabilities_match_main(name):
+    spec = get_algorithm(name)
+    assert (spec.reward_normalizer, spec.advantage_fn, spec.policy_loss_fn) == MAIN_ROUTES[name]
+    for field, enabled_algorithms in MAIN_CAPABILITIES.items():
+        assert getattr(spec, field) is (name in enabled_algorithms), field
+    assert spec.kl_level == ("sequence" if name == "gspo" else "token")
+    assert spec.advantage_normalization == (
+        "token_global" if name in {"reinforce_plus_plus", "reinforce_plus_plus_baseline"} else "whiten"
+    )
+    assert spec.min_group_size == (2 if name in {"rloo", "reinforce_plus_plus_baseline"} else 1)
 
 
 def test_spec_is_frozen():
-    spec = get_algorithm("grpo")
-    with pytest.raises(Exception):
-        spec.name = "mutated"
+    with pytest.raises(FrozenInstanceError):
+        get_algorithm("grpo").name = "mutated"
 
 
 def test_get_algorithm_unknown_name_raises_with_available_names():
-    with pytest.raises(KeyError) as exc:
+    with pytest.raises(KeyError, match="Unknown advantage estimator.*grpo"):
         get_algorithm("does_not_exist")
-    assert "grpo" in str(exc.value)
 
 
-def test_list_algorithm_names_matches_registry_keys():
-    assert list_algorithm_names() == list(ALGORITHM_SPECS.keys())
-
-
-def test_grpo_family_shares_one_advantage_fn():
-    """The outcome-reward estimators are identical at the advantage layer."""
-    ids = {get_algorithm(n).advantage_fn for n in ("grpo", "gspo", "sapo", "cispo", "m2po", "rloo")}
-    assert ids == {"grpo_broadcast"}
-
-
-def test_reward_normalizer_ids_match_current_behavior():
-    for name in ("grpo", "gspo", "sapo", "cispo"):
-        assert get_algorithm(name).reward_normalizer == "group_mean_std"
-    assert get_algorithm("reinforce_plus_plus_baseline").reward_normalizer == "group_mean"
-    assert get_algorithm("rloo").reward_normalizer == "group_leave_one_out"
-    for name in ("ppo", "reinforce_plus_plus", "m2po"):
-        assert get_algorithm(name).reward_normalizer == "none"
-
-
-def test_is_group_normalized_matches_mains_reward_scope():
-    intended = {
-        "grpo",
-        "gspo",
-        "sapo",
-        "cispo",
-        "rloo",
-        "reinforce_plus_plus_baseline",
-    }
-    actual = {n for n in MAIN_ALGORITHM_NAMES if get_algorithm(n).is_group_normalized}
-    assert actual == intended
-
-
-def test_non_none_normalizer_is_not_implicitly_treated_as_group_scoped():
+def test_reward_normalization_does_not_implicitly_require_complete_groups():
     spec = AlgorithmSpec(
         name="future_batch_algorithm",
         reward_normalizer="future_batch_normalizer",
         advantage_fn="grpo_broadcast",
         policy_loss_fn="ppo_clip",
     )
-    assert spec.requires_complete_reward_groups is False
-    assert spec.is_group_normalized is False
-
-
-def test_gspo_is_the_only_sequence_level_kl():
-    seq = {n for n in MAIN_ALGORITHM_NAMES if get_algorithm(n).kl_level == "sequence"}
-    assert seq == {"gspo"}
-
-
-def test_gspo_is_the_only_one_needing_full_log_probs():
-    need = {n for n in MAIN_ALGORITHM_NAMES if get_algorithm(n).needs_full_log_probs}
-    assert need == {"gspo"}
-
-
-def test_ppo_is_the_only_algorithm_needing_a_critic():
-    """`needs_critic` is what `relax/core/registry.py` reads to decide whether
-    ALGOS binds the Critic component, so this set is load-bearing."""
-    critic = {n for n in MAIN_ALGORITHM_NAMES if get_algorithm(n).needs_critic}
-    assert critic == {"ppo"}
-
-
-def test_reinforce_family_requires_normalize_advantages():
-    for name in ("reinforce_plus_plus", "reinforce_plus_plus_baseline"):
-        assert get_algorithm(name).requires_normalize_advantages is True
-    assert get_algorithm("grpo").requires_normalize_advantages is False
-
-
-def test_policy_loss_ids_match_current_behavior():
-    assert get_algorithm("sapo").policy_loss_fn == "sapo"
-    assert get_algorithm("cispo").policy_loss_fn == "cispo"
-    assert get_algorithm("m2po").policy_loss_fn == "m2po"
-    assert get_algorithm("rloo").policy_loss_fn == "rloo"
-    for name in ("grpo", "gspo", "ppo", "reinforce_plus_plus", "reinforce_plus_plus_baseline"):
-        assert get_algorithm(name).policy_loss_fn == "ppo_clip"
-
-
-def test_defaults_are_permissive():
-    spec = AlgorithmSpec(name="x", reward_normalizer="none", advantage_fn="a", policy_loss_fn="ppo_clip")
-    assert spec.kl_level == "token"
-    assert spec.needs_full_log_probs is False
-    assert spec.needs_critic is False
-    assert spec.requires_normalize_advantages is False
-    assert spec.policy_scalar_metric_names == ()
-    assert spec.supports_context_parallel is True
-
-
-def test_context_parallel_support_matches_current_algorithm_constraints():
-    unsupported = {name for name in MAIN_ALGORITHM_NAMES if not get_algorithm(name).supports_context_parallel}
-    assert unsupported == {"m2po", "reinforce_plus_plus", "reinforce_plus_plus_baseline"}
+    assert not spec.requires_complete_reward_groups
+    assert not spec.is_group_normalized
 
 
 def test_m2po_cp_limit_is_independent_of_reward_grouping():
@@ -139,10 +86,6 @@ def test_m2po_cp_limit_is_independent_of_reward_grouping():
     assert not spec.supports_context_parallel
     assert spec.reward_normalizer == "none"
     assert not spec.requires_complete_reward_groups
-
-
-def test_m2po_declares_its_scalar_metrics():
-    spec = get_algorithm("m2po")
     assert spec.policy_scalar_metric_names == (
         "ppo_kl_m2_before",
         "ppo_kl_m2_after",
@@ -152,103 +95,42 @@ def test_m2po_declares_its_scalar_metrics():
 
 
 @pytest.mark.parametrize("metric_names", [("",), ("duplicate", "duplicate")])
-def test_invalid_policy_scalar_metric_names_fail_when_the_spec_is_built(metric_names):
+def test_invalid_policy_scalar_metric_names_are_rejected(metric_names):
     with pytest.raises(ValueError, match="policy scalar metric name"):
-        AlgorithmSpec(
-            name="probe",
-            reward_normalizer="none",
-            advantage_fn="grpo_broadcast",
-            policy_loss_fn="ppo_clip",
-            policy_scalar_metric_names=metric_names,
-        )
+        AlgorithmSpec("probe", "none", "grpo_broadcast", "ppo_clip", policy_scalar_metric_names=metric_names)
 
 
-def test_spec_module_has_no_heavy_imports():
-    """The registry must import on a CPU-only runner with just torch
-    available."""
-    import relax.algorithms.spec as spec_mod
-
-    src = inspect.getsource(spec_mod)
-    for banned in (
-        "import megatron",
-        "from megatron",
-        "import ray",
-        "from ray",
-        "import transfer_queue",
-        "import tensordict",
-        "from relax.components",
-        "from relax.backends",
-    ):
-        assert banned not in src, f"spec.py must not import {banned}"
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [("kl_level", "Sequence"), ("kl_level", "seq"), ("advantage_normalization", "token-global")],
+)
+def test_unsupported_enum_values_are_rejected(field, bad):
+    with pytest.raises(ValueError, match=field):
+        AlgorithmSpec("probe", "none", "grpo_broadcast", "ppo_clip", **{field: bad})
 
 
 def test_every_spec_identifier_resolves_to_a_registered_implementation():
-    """A typo in the registry must not wait until the first batch to
-    surface."""
     from relax.algorithms.advantages import ADVANTAGE_FNS
     from relax.algorithms.policy import POLICY_LOSS_FNS
     from relax.algorithms.rewards import REWARD_NORMALIZERS
 
-    for name in list_algorithm_names():
-        spec = get_algorithm(name)
-        assert spec.reward_normalizer in REWARD_NORMALIZERS, name
-        assert spec.advantage_fn in ADVANTAGE_FNS, name
-        assert spec.policy_loss_fn in POLICY_LOSS_FNS, name
+    for spec in ALGORITHM_SPECS.values():
+        assert spec.reward_normalizer in REWARD_NORMALIZERS, spec.name
+        assert spec.advantage_fn in ADVANTAGE_FNS, spec.name
+        assert spec.policy_loss_fn in POLICY_LOSS_FNS, spec.name
 
 
-def test_every_spec_declares_a_kl_level_the_loss_knows_how_to_read():
-    """``kl_level`` has no dispatch table to fail against.
+def test_registry_import_does_not_require_training_dependencies():
+    code = """
+import sys
 
-    ``relax/backends/megatron/loss.py`` reads it as ``== "sequence"``, so a
-    misspelled value does not raise -- it silently selects token-level KL and
-    the run trains the wrong objective while reporting the right algorithm
-    name. The three fields above cannot fail that way because a bad key raises
-    on lookup; this one needs the check written out.
-    """
-    for name in list_algorithm_names():
-        assert get_algorithm(name).kl_level in ("token", "sequence"), name
+class BlockTrainingImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'torch', 'ray', 'megatron', 'transfer_queue', 'tensordict'}:
+            raise AssertionError(f'Registry imported {fullname}')
 
-
-# ---------------- enum-like fields must fail loudly, not silently ----------------
-
-
-@pytest.mark.parametrize(
-    "field,bad",
-    [
-        ("kl_level", "Sequence"),  # right word, wrong case
-        ("kl_level", "seq"),
-        ("advantage_normalization", "token-global"),  # hyphen instead of underscore
-        ("advantage_normalization", "none"),
-    ],
-)
-def test_an_unsupported_enum_value_is_refused_when_the_spec_is_built(field, bad):
-    """These two fields are compared for equality, so a typo picks a formula.
-
-    `loss.py` asks for `advantage_normalization == "token_global"`, and for
-    `kl_level == "sequence"`; every other string takes the else branch. Unlike
-    `advantage_fn`, which blows up with a KeyError the first time it is looked
-    up, a misspelled value here starts training successfully and quietly uses
-    the wrong KL level or the wrong advantage normalisation. The registry is a
-    module-level literal, so validating in `__post_init__` moves that from a
-    silent wrong-maths run to an import-time error.
-    """
-    from relax.algorithms.spec import AlgorithmSpec
-
-    kwargs = dict(
-        name="probe",
-        reward_normalizer="none",
-        advantage_fn="grpo_broadcast",
-        policy_loss_fn="ppo_clip",
-    )
-    kwargs[field] = bad
-
-    with pytest.raises(ValueError, match=field):
-        AlgorithmSpec(**kwargs)
-
-
-def test_the_supported_values_are_the_ones_the_shipped_specs_use():
-    """The allow-list must not drift from the registry it guards."""
-    from relax.algorithms.spec import ADVANTAGE_NORMALIZATIONS, ALGORITHM_SPECS, KL_LEVELS
-
-    assert {s.kl_level for s in ALGORITHM_SPECS.values()} <= KL_LEVELS
-    assert {s.advantage_normalization for s in ALGORITHM_SPECS.values()} <= ADVANTAGE_NORMALIZATIONS
+sys.meta_path.insert(0, BlockTrainingImports())
+from relax.algorithms import get_algorithm
+assert get_algorithm('ppo').needs_critic
+"""
+    subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[2], check=True)

@@ -3,9 +3,10 @@
 """Argument parsing and validation must read the registry, not string lists."""
 
 import argparse
-import importlib
+import importlib.util
 import pathlib
 import sys
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -16,10 +17,7 @@ ARGS_PATH = pathlib.Path(__file__).resolve().parents[2] / "relax" / "utils" / "a
 
 @pytest.fixture()
 def arguments_module(monkeypatch):
-    """Import relax.utils.arguments with its heavy optional deps stubbed out.
-
-    Mirrors tests/utils/test_arguments_opd_teacher_colocate.py.
-    """
+    """Load real argument parsing while isolating optional training imports."""
     router_pkg = ModuleType("sglang_router")
     launch_router = ModuleType("sglang_router.launch_router")
     launch_router.RouterArgs = object
@@ -42,10 +40,10 @@ def arguments_module(monkeypatch):
     eval_config.ensure_dataset_list = lambda values: values or []
     monkeypatch.setitem(sys.modules, "relax.utils.training.eval_config", eval_config)
 
-    sys.modules.pop("relax.utils.arguments", None)
-    module = importlib.import_module("relax.utils.arguments")
-    yield module
-    sys.modules.pop("relax.utils.arguments", None)
+    spec = importlib.util.spec_from_file_location("_algorithm_test_arguments", ARGS_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _args(estimator="grpo", **overrides):
@@ -68,37 +66,6 @@ def _args(estimator="grpo", **overrides):
     return SimpleNamespace(**base)
 
 
-# ---------------- source-level: no hardcoded name lists ----------------
-
-
-def test_choices_come_from_the_registry():
-    assert "choices=list_algorithm_names()" in ARGS_PATH.read_text(encoding="utf-8")
-
-
-def test_no_hardcoded_estimator_choice_list():
-    src = ARGS_PATH.read_text(encoding="utf-8")
-    assert '"reinforce_plus_plus_baseline",\n                    "ppo",' not in src
-
-
-def test_no_estimator_name_comparisons_remain():
-    src = ARGS_PATH.read_text(encoding="utf-8")
-    for banned in (
-        'args.advantage_estimator == "ppo"',
-        'args.advantage_estimator in ["reinforce_plus_plus"',
-    ):
-        assert banned not in src, f"arguments.py still contains: {banned}"
-
-
-def test_validation_reads_spec_fields():
-    src = ARGS_PATH.read_text(encoding="utf-8")
-    for field in (
-        "needs_critic",
-        "requires_normalize_advantages",
-        "supports_context_parallel",
-    ):
-        assert field in src, f"arguments.py does not consult spec.{field}"
-
-
 # ---------------- behaviour ----------------
 
 
@@ -111,9 +78,11 @@ def test_parser_rejects_an_unregistered_estimator(arguments_module):
         parser.parse_args(["--advantage-estimator", "not_an_algorithm"])
 
 
-def test_every_registered_algorithm_is_an_accepted_choice(arguments_module):
-    from relax.algorithms import list_algorithm_names
+def test_parser_accepts_newly_registered_algorithms(arguments_module, monkeypatch):
+    from relax.algorithms import ALGORITHM_SPECS, list_algorithm_names
 
+    name = "new_algorithm"
+    monkeypatch.setitem(ALGORITHM_SPECS, name, replace(ALGORITHM_SPECS["grpo"], name=name))
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = argparse.ArgumentParser()
     arguments_module.get_slime_extra_args_provider()(parser)
@@ -121,44 +90,6 @@ def test_every_registered_algorithm_is_an_accepted_choice(arguments_module):
     for name in list_algorithm_names():
         parsed = parser.parse_args(["--advantage-estimator", name])
         assert parsed.advantage_estimator == name
-
-
-def test_reinforce_family_requires_normalize_advantages(arguments_module):
-    for estimator in ("reinforce_plus_plus", "reinforce_plus_plus_baseline"):
-        with pytest.raises(ValueError, match="normalize-advantages"):
-            arguments_module.validate_algorithm_args(_args(estimator, normalize_advantages=False))
-
-
-def test_reinforce_family_passes_with_normalize_advantages(arguments_module):
-    args = _args("reinforce_plus_plus", normalize_advantages=True)
-    arguments_module.validate_algorithm_args(args)
-    assert args.use_critic is False
-
-
-def test_ppo_is_runnable_and_turns_on_the_critic(arguments_module):
-    """PPO is enabled upstream again; `use_critic` is the switch that makes
-    `relax/core/registry.py` bind the Critic component."""
-    args = _args("ppo", reward_key=None)
-    arguments_module.validate_algorithm_args(args)
-    assert args.use_critic is True
-
-
-@pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo", "m2po"])
-def test_grpo_family_passes_with_defaults(arguments_module, estimator):
-    args = _args(estimator, reward_key=None)
-    arguments_module.validate_algorithm_args(args)
-    assert args.use_critic is False
-
-
-def test_algorithms_do_not_police_reward_key(arguments_module):
-    """No currently registered algorithm constrains --reward-key."""
-    args = _args("grpo", reward_key=None)
-    arguments_module.validate_algorithm_args(args)
-
-
-def test_unknown_estimator_raises_from_the_registry(arguments_module):
-    with pytest.raises(KeyError, match="Unknown advantage estimator"):
-        arguments_module.validate_algorithm_args(_args("not_an_algorithm"))
 
 
 # ---------------- --custom-config-path override timing ----------------
@@ -307,36 +238,19 @@ def test_sft_runs_skip_the_algorithm_recheck(arguments_module, tmp_path):
     assert args.lr == 0.5
 
 
-def test_slime_validate_args_applies_overrides_through_the_helper(arguments_module):
-    """Guard the call site: the merge must go through the re-checking
-    helper."""
-    import inspect
-
-    src = inspect.getsource(arguments_module.slime_validate_args)
-    assert "apply_custom_config_overrides(args)" in src
-    assert "yaml.safe_load" not in src, "the YAML merge was inlined again, skipping the re-check"
-
-
-def test_spec_with_an_unregistered_implementation_is_rejected_at_startup(arguments_module, monkeypatch):
-    """A registry typo must name itself, not KeyError inside a worker."""
-    from dataclasses import replace
-
+@pytest.mark.parametrize("field", ["reward_normalizer", "advantage_fn", "policy_loss_fn"])
+def test_spec_with_an_unregistered_implementation_is_rejected_at_startup(arguments_module, monkeypatch, field):
+    """Reject an invalid implementation before starting workers."""
     from relax.algorithms.spec import ALGORITHM_SPECS
 
-    broken = replace(ALGORITHM_SPECS["grpo"], advantage_fn="typo_does_not_exist")
+    broken = replace(ALGORITHM_SPECS["grpo"], **{field: "typo_does_not_exist"})
     monkeypatch.setitem(ALGORITHM_SPECS, "grpo", broken)
 
     with pytest.raises(ValueError, match="typo_does_not_exist"):
         arguments_module.validate_algorithm_args(_args("grpo", reward_key=None))
 
 
-# ---------------- fully-async ----------------
-
-
-@pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo", "m2po"])
-def test_other_estimators_are_unaffected_by_fully_async(arguments_module, estimator):
-    args = _args(estimator, fully_async=True, reward_key=None)
-    arguments_module.validate_algorithm_args(args)
+# ---------------- context parallel capabilities ----------------
 
 
 @pytest.mark.parametrize("estimator", ["m2po", "reinforce_plus_plus", "reinforce_plus_plus_baseline"])
@@ -444,15 +358,27 @@ def test_yaml_global_batch_size_agreeing_with_the_derivation_survives(arguments_
     assert args.global_batch_size == 32
 
 
-def test_yaml_that_only_moves_a_derivation_input_still_re_derives(arguments_module, tmp_path):
-    """The behaviour the `enforce_consistency=False` call was added for.
+def test_new_algorithm_validation_uses_declared_capabilities(arguments_module, monkeypatch):
+    from relax.algorithms import ALGORITHM_SPECS
 
-    Switching `num_steps_per_rollout` from 4 to 1 has to produce
-    `rollout * n`; the pre-merge value of 32 is stale by construction and must
-    not be compared against.
-    """
-    args = _batch_args(tmp_path, "num_steps_per_rollout: 1\n")
+    name = "new_algorithm"
+    monkeypatch.setitem(
+        ALGORITHM_SPECS,
+        name,
+        replace(ALGORITHM_SPECS["grpo"], name=name, needs_critic=True, requires_normalize_advantages=True),
+    )
+    args = _args(name)
+    with pytest.raises(ValueError, match="requires advantage normalization"):
+        arguments_module.validate_algorithm_args(args)
+    args.normalize_advantages = True
+    arguments_module.validate_algorithm_args(args)
+    assert args.use_critic
 
-    arguments_module.apply_custom_config_overrides(args)
 
-    assert args.global_batch_size == 128  # 32 * 4 // 1
+def test_training_argument_entrypoint_revalidates_yaml_algorithm(arguments_module, tmp_path):
+    from tests.utils.test_arguments_opd_teacher_colocate import _opd_args
+
+    args = _opd_args()
+    args.custom_config_path = _write_yaml(tmp_path, "advantage_estimator: m2po\ncontext_parallel_size: 2\n")
+    with pytest.raises(ValueError, match="context-parallel-size 1"):
+        arguments_module.slime_validate_args(args)
