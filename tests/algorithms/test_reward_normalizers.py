@@ -60,7 +60,8 @@ def _legacy_post_process_rewards(args, samples, raw_rewards):
 
 
 def _new_normalize(args, samples, raw_rewards):
-    """Exercise the registered normalizer; entrypoint hooks are tested separately."""
+    """Exercise the registered normalizer; entrypoint hooks are tested
+    separately."""
     spec = get_algorithm(args.advantage_estimator)
     return REWARD_NORMALIZERS[spec.reward_normalizer](args, samples, raw_rewards)
 
@@ -141,7 +142,8 @@ def test_m2po_preserves_mains_raw_rewards():
 
 
 def _main_rloo_normalized_rewards(samples, raw_rewards):
-    """Frozen RLOO reward branch from main@5cec8ca1, independent of its kernel."""
+    """Frozen RLOO reward branch from main@5cec8ca1, independent of its
+    kernel."""
     rewards = torch.tensor(raw_rewards, dtype=torch.float)
     positions_by_group: dict[int, list[int]] = {}
     for position, sample in enumerate(samples):

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Reward entrypoint compatibility through the production registry dispatcher."""
+"""Reward entrypoint compatibility through the production registry
+dispatcher."""
 
 import importlib.util
 import sys
@@ -16,7 +17,8 @@ pytest.importorskip("torch")
 
 @pytest.fixture()
 def utils_mod(monkeypatch):
-    """Load the real dispatcher without unrelated Ray, TensorDict, or HTTP imports."""
+    """Load the real dispatcher without unrelated Ray, TensorDict, or HTTP
+    imports."""
     tensordict = ModuleType("tensordict")
     tensordict.TensorDict = dict
     misc = ModuleType("relax.utils.misc")

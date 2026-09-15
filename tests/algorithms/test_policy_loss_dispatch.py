@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Policy adapters preserve kernel arguments, gradients and metric contracts."""
+"""Policy adapters preserve kernel arguments, gradients and metric
+contracts."""
 
 import ast
 import dataclasses
