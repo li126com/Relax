@@ -1,5 +1,7 @@
 import taskLists from 'markdown-it-task-lists'
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitepress'
+import sourceLinks from './plugins/source-links'
 
 // https://vitepress.dev/reference/site-config
 export default defineConfig({
@@ -215,6 +217,12 @@ export default defineConfig({
     math: true,
     config(md) {
       md.use(taskLists)
+      md.use(sourceLinks, {
+        repo: 'https://github.com/redai-studio/Relax',
+        branch: 'main',
+        repoRoot: fileURLToPath(new URL('../..', import.meta.url)),
+        docsRoot: 'docs'
+      })
     }
   },
   
@@ -278,13 +286,15 @@ export default defineConfig({
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
                 { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' },
-                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' }
+                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' },
+                { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' }
               ]
             },
             {
               text: 'Best Practices',
               items: [
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
+                { text: 'Compiler Cache Reuse', link: '/en/guide/compiler-cache' },
                 { text: 'Accelerated S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
                 { text: 'External Model Integration', link: '/en/guide/external-model-integration' }
@@ -395,13 +405,15 @@ export default defineConfig({
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
-                { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' }
+                { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' },
+                { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' }
               ]
             },
             {
               text: '最佳实践',
               items: [
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
+                { text: '编译缓存复用', link: '/zh/guide/compiler-cache' },
                 { text: 'S3 模型加载加速', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
                 { text: '外部模型接入', link: '/zh/guide/external-model-integration' }

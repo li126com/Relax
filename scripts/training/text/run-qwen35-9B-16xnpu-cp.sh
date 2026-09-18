@@ -46,7 +46,7 @@ CKPT_ARGS=(
    --max-actor-ckpt-to-keep 1
 )
 
-PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl 
+PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}

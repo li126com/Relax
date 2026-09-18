@@ -139,7 +139,7 @@ class Advantages(Base):
             "rollout_log_probs" if self.config.use_rollout_logprobs else "log_probs"
         )
         ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
-        rewards: list[float] = rollout_data.get("rewards")
+        rewards: torch.Tensor = rollout_data.get("rewards")
         values: None | list[torch.Tensor] = rollout_data.get("values")
         response_lengths: list[int] = rollout_data.get("response_lengths")
         loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
