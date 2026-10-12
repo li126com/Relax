@@ -1,13 +1,11 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.17-cu129
+ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.21-cu130
 ARG TRAIN_IMAGE=train
 FROM ${BASE_IMAGE} as base
 
-ENV NVIDIA_PYTORCH_VERSION=25.06 \
-    PYTORCH_BUILD_VERSION=2.9.0 \
-    TARGETARCH=amd64 \
+ENV TARGETARCH=amd64 \
     PYVER=3.12 \
     PYSFX=3 \
     L4T=0 \
@@ -33,13 +31,12 @@ FROM base as sglang
 
 WORKDIR /sgl-workspace/sglang
 
-RUN pip install nvidia-cudnn-cu12==9.16.0.29
-
 FROM base as train
 
-RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
-    pip install --no-cache-dir flash-linear-attention==0.4.2 && \
-    pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
+# Rebuild FA2 against the base Torch/CUDA ABI; inherit TileLang 0.1.12.
+RUN FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS="90" MAX_JOBS=64 \
+    pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
+    pip install --no-cache-dir flash-linear-attention==0.4.2
 
 # DeepSeek-V4 DSA deps, both listed under mcore's `no_pypi_wheels` so built from pinned source:
 #   - fast-hadamard-transform: required by the Lightning Indexer (dsa.rotate_activation asserts on it)
@@ -82,10 +79,9 @@ RUN MAX_JOBS=64 \
     cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'stray top-level flash_attn_interface still importable'; import flash_attn_config" && \
     rm -rf /opt/flash-attention/
 
-RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
-    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
-    pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
-    pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
+RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[core_cu13,pytorch]==2.14.1" && \
+    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall --no-deps && \
+    pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \
     --no-build-isolation \
@@ -155,7 +151,10 @@ RUN pip install --ignore-installed PyJWT && \
 # MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
 # Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.
 # The final stage also covers externally supplied TRAIN_IMAGE builds.
-RUN pip install --no-cache-dir \
+RUN cupti_root="$(python -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')/nvidia/cu13" && \
+    ln -sf libcupti.so.13 "$cupti_root/lib/libcupti.so" && \
+    CUDA_PATH="$cupti_root" CPLUS_INCLUDE_PATH="${CUDA_HOME}/include:${CPLUS_INCLUDE_PATH}" \
+    pip install --no-cache-dir \
     "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
 
 # Pin both FLA distributions in the final stage, including external TRAIN_IMAGE builds.
@@ -179,6 +178,7 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
 COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
+COPY docker/scripts/setup_memory_saver.py /tmp/setup_memory_saver.py
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
@@ -187,8 +187,8 @@ RUN cd Megatron-LM && \
     fi && \
     patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
     rm megatron.patch sync-save-bounded-staging.patch && \
-    apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
-    /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
+    apt update && apt install -y jq && \
+    python /tmp/setup_memory_saver.py
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
 COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
@@ -204,3 +204,6 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     git apply sglang_per_pos_topk.patch && \
     rm sglang.patch sglang_per_pos_topk.patch; \
 fi
+
+# Restore the official DeepEP runtime after Torch's NCCL dependency resolution.
+RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7
