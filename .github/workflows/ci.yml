@@ -63,6 +63,16 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # The patch tests read source without importing or installing SGLang.
+      - name: Checkout SGLang patch baseline
+        uses: actions/checkout@v7
+        with:
+          repository: sgl-project/sglang
+          ref: e00930c5489053f26d86b179cee0d087f846acbb # v0.5.21
+          path: .test-sources/sglang
+          sparse-checkout: python/sglang
+          persist-credentials: false
+
       - name: Cache pip
         uses: actions/cache@v6
         with:
@@ -108,6 +118,8 @@ jobs:
           "
 
       - name: Run tests
+        env:
+          SGLANG_SOURCE_DIR: ${{ github.workspace }}/.test-sources/sglang
         run: |
           pytest tests/ \
             -v \

@@ -36,7 +36,7 @@ FROM base as train
 # Rebuild FA2 against the base Torch/CUDA ABI; inherit TileLang 0.1.12.
 RUN FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS="90" MAX_JOBS=64 \
     pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
-    pip install --no-cache-dir flash-linear-attention==0.4.2
+    pip install --no-cache-dir flash-linear-attention==0.5.2
 
 # DeepSeek-V4 DSA deps, both listed under mcore's `no_pypi_wheels` so built from pinned source:
 #   - fast-hadamard-transform: required by the Lightning Indexer (dsa.rotate_activation asserts on it)
@@ -81,7 +81,7 @@ RUN MAX_JOBS=64 \
 
 RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[core_cu13,pytorch]==2.14.1" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall --no-deps && \
-    pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir && \
+    pip install "nvidia-modelopt==0.44.0" --no-build-isolation --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \
     --no-build-isolation \
@@ -145,7 +145,7 @@ COPY requirements.txt /tmp/requirements.txt
 
 RUN pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
-    pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
+    pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps
 
 # MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
@@ -156,10 +156,6 @@ RUN cupti_root="$(python -c 'import sysconfig; print(sysconfig.get_paths()["plat
     CUDA_PATH="$cupti_root" CPLUS_INCLUDE_PATH="${CUDA_HOME}/include:${CPLUS_INCLUDE_PATH}" \
     pip install --no-cache-dir \
     "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
-
-# Pin both FLA distributions in the final stage, including external TRAIN_IMAGE builds.
-RUN pip install --no-cache-dir --force-reinstall --no-deps \
-    "fla-core==0.5.2" "flash-linear-attention==0.5.2"
 
 # Preserve small KDA gate gradients in FP32 dot products inside the backward kernel.
 COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-precision.patch

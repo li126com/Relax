@@ -4,31 +4,20 @@
 from __future__ import annotations
 
 import ast
-import textwrap
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
-from tests.tools.test_sglang_weight_update_compat import PATCH_PATH, _extract_methods, _new_file_fragments
+from tests.tools.sglang_patch_source import PATCH_PATH, patched_functions
 
 
 SRT = "python/sglang/srt/"
 
 
 def _method(path: str, name: str, namespace: dict[str, Any]) -> Any:
-    patch = PATCH_PATH.read_text()
-    if path == "state_capturer/base.py" and name == "on_forward_end":
-        # This is the source file's final method; require its explicit final return.
-        fragment = next(
-            lines for lines in _new_file_fragments(patch, SRT + path) if "    def on_forward_end(" in lines
-        )
-        assert fragment[-1] == "        return None", "Final method context is truncated"
-        source = textwrap.dedent("\n".join(fragment[fragment.index("    def on_forward_end(") :]))
-        node = ast.parse(source).body[0]
-    else:
-        node = _extract_methods(patch, SRT + path, {name})[0]
+    node = patched_functions(SRT + path, {name})[0]
     node.decorator_list = []
     module = ast.Module(body=[ast.parse("from __future__ import annotations").body[0], node], type_ignores=[])
     ast.fix_missing_locations(module)
@@ -37,18 +26,7 @@ def _method(path: str, name: str, namespace: dict[str, Any]) -> Any:
 
 
 def _capture_helper(namespace: dict[str, Any]) -> Any:
-    for fragment in _new_file_fragments(PATCH_PATH.read_text(), SRT + "layers/moe/topk.py"):
-        start = next(
-            (i for i, line in enumerate(fragment) if line.startswith("def capture_routed_experts_if_allowed(")), None
-        )
-        if start is None:
-            continue
-        end = next((i for i in range(start + 1, len(fragment)) if fragment[i].startswith("def ")), None)
-        if end is None:
-            raise AssertionError("Capture helper context is truncated")
-        exec("from __future__ import annotations\n" + "\n".join(fragment[start:end]), namespace)
-        return namespace["capture_routed_experts_if_allowed"]
-    raise AssertionError("Capture helper is missing")
+    return _method("layers/moe/topk.py", "capture_routed_experts_if_allowed", namespace)
 
 
 class _Rows:
@@ -272,19 +250,23 @@ class TestDeepseekV41WeightUpdate(unittest.TestCase):
 
 class TestDeepseekV41Mhc(unittest.TestCase):
     def test_mhc_small_batch_uses_existing_tile_for_v41_width(self) -> None:
-        fragments = _new_file_fragments(PATCH_PATH.read_text(), "python/sglang/kernels/ops/layernorm/mhc.py")
-        source = next(
-            "\n".join(fragment)
-            for fragment in fragments
-            if any("split_size = hc_hidden_size" in line for line in fragment)
+        function = patched_functions("python/sglang/kernels/ops/layernorm/mhc.py", {"mhc_pre"})[0]
+        branch = next(
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "num_tokens <= 2048"
         )
-        start = source.index("            split_size = hc_hidden_size")
-        end = source.index("            kernel_0,", start)
-        namespace: dict[str, Any] = {}
-        exec(textwrap.dedent(source[start:end]), {"hc_hidden_size": 20480, "n_splits_pre": 32}, namespace)
-        self.assertEqual(namespace["hidden_block"], 128)
-        for width, expected in ((16384, 256), (28672, 128)):
-            exec(textwrap.dedent(source[start:end]), {"hc_hidden_size": width, "n_splits_pre": 32}, namespace)
+        start = next(
+            index
+            for index, node in enumerate(branch.body)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "split_size" for t in node.targets)
+        )
+        module = ast.Module(body=branch.body[start : start + 2], type_ignores=[])
+        code = compile(module, str(PATCH_PATH), "exec")
+        for width, expected in ((20480, 128), (16384, 256), (28672, 128)):
+            namespace: dict[str, Any] = {}
+            exec(code, {"hc_hidden_size": width, "n_splits_pre": 32}, namespace)
             self.assertEqual(namespace["hidden_block"], expected)
 
 

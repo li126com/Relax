@@ -1,22 +1,27 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Exercise patched SGLang session methods without importing GPU dependencies."""
+"""Test session methods from the complete patched SGLang source."""
 
 from __future__ import annotations
 
 import ast
 import asyncio
-import re
-import textwrap
 import unittest
 from contextlib import nullcontext
 from functools import lru_cache
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, Mock, call, patch
 
+from tests.tools.sglang_patch_source import (
+    PATCH_PATH,
+    _blob_hash,
+    _validated_source,
+    apply_file_patch,
+    extract_functions,
+    patched_functions,
+)
 
-PATCH_PATH = Path(__file__).resolve().parents[2] / "docker/patch/sglang/v0.5.21.patch"
+
 CONTROL_PATH = "python/sglang/srt/managers/tokenizer_control_mixin.py"
 MANAGER_PATH = "python/sglang/srt/managers/tokenizer_manager.py"
 SCHEDULER_PATH = "python/sglang/srt/managers/scheduler_components/weight_updater.py"
@@ -34,87 +39,6 @@ CONTROL_METHODS = {
     "release_memory_occupation",
     "resume_memory_occupation",
 }
-HUNK_PATTERN = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-METHOD_PATTERN = re.compile(r"^    (?:async )?def (\w+)\(")
-METHOD_BOUNDARY_PATTERN = re.compile(r"^(?:    (?:async )?def \w+\(|    @|[^\s#])")
-
-
-def _new_file_fragments(patch: str, target: str) -> list[list[str]]:
-    """Reconstruct only new-side lines actually present in the unified diff."""
-    sections = patch.split("diff --git ")
-    section = next((part for part in sections if part.startswith(f"a/{target} b/{target}\n")), None)
-    if section is None:
-        raise AssertionError(f"No patch section for {target}")
-
-    new_lines: dict[int, str] = {}
-    lines = section.splitlines()
-    index = 0
-    while index < len(lines):
-        match = HUNK_PATTERN.match(lines[index])
-        index += 1
-        if match is None:
-            continue
-        old_remaining = int(match.group(2) or "1")
-        new_position = int(match.group(3))
-        new_remaining = int(match.group(4) or "1")
-        while old_remaining or new_remaining:
-            if index >= len(lines):
-                raise AssertionError(f"Truncated diff hunk for {target}")
-            line = lines[index]
-            index += 1
-            if line.startswith("\\"):
-                continue
-            if line.startswith(" "):
-                old_remaining -= 1
-                new_remaining -= 1
-            elif line.startswith("-"):
-                old_remaining -= 1
-                continue
-            elif line.startswith("+"):
-                new_remaining -= 1
-            else:
-                raise AssertionError(f"Malformed diff hunk for {target}: {line!r}")
-            if old_remaining < 0 or new_remaining < 0:
-                raise AssertionError(f"Inconsistent diff counts for {target}")
-            if new_position in new_lines and new_lines[new_position] != line[1:]:
-                raise AssertionError(f"Conflicting new-side lines for {target}")
-            new_lines[new_position] = line[1:]
-            new_position += 1
-
-    fragments: list[list[str]] = []
-    previous_position: int | None = None
-    for position, line in sorted(new_lines.items()):
-        if previous_position is None or position != previous_position + 1:
-            fragments.append([])
-        fragments[-1].append(line)
-        previous_position = position
-    return fragments
-
-
-def _extract_methods(patch: str, target: str, names: set[str]) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
-    """Require complete methods and their following boundary; never fill context gaps."""
-    methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
-    for fragment in _new_file_fragments(patch, target):
-        for start, line in enumerate(fragment):
-            match = METHOD_PATTERN.match(line)
-            if match is None or match.group(1) not in names:
-                continue
-            end = next(
-                (index for index in range(start + 1, len(fragment)) if METHOD_BOUNDARY_PATTERN.match(fragment[index])),
-                None,
-            )
-            if end is None:
-                raise AssertionError(f"Patch lacks complete context after {target}:{match.group(1)}")
-            tree = ast.parse(textwrap.dedent("\n".join(fragment[start:end])))
-            if len(tree.body) != 1 or not isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
-                raise AssertionError(f"Could not extract one complete method from {target}:{match.group(1)}")
-            if match.group(1) in methods:
-                raise AssertionError(f"Duplicate method in patch: {target}:{match.group(1)}")
-            methods[match.group(1)] = tree.body[0]
-    missing = names - methods.keys()
-    if missing:
-        raise AssertionError(f"Patch lacks complete method context in {target}: {sorted(missing)}")
-    return list(methods.values())
 
 
 class _FanOut:
@@ -130,9 +54,8 @@ class _Request(SimpleNamespace):
 
 @lru_cache(maxsize=1)
 def _manager_class() -> type[Any]:
-    patch = PATCH_PATH.read_text()
-    methods = _extract_methods(patch, CONTROL_PATH, CONTROL_METHODS)
-    methods += _extract_methods(patch, MANAGER_PATH, {"continue_generation"})
+    methods = patched_functions(CONTROL_PATH, CONTROL_METHODS)
+    methods += patched_functions(MANAGER_PATH, {"continue_generation"})
     module = ast.parse("from __future__ import annotations\nclass Manager:\n    pass\n")
     manager_class = module.body[1]
     assert isinstance(manager_class, ast.ClassDef)
@@ -228,7 +151,8 @@ class _CPUFlag:
 
 
 class _CPUCollectives:
-    """Model CPU MIN using declared TP peers; no torch or distributed runtime."""
+    """Model CPU MIN using declared TP peers; no torch or distributed
+    runtime."""
 
     def __init__(self, peer_empty_flags: list[int]) -> None:
         self.peer_empty_flags = peer_empty_flags
@@ -255,8 +179,7 @@ class _CPUCollectives:
 
 def _scheduler_manager(peer_empty_flags: list[int], *, legacy: bool = True) -> tuple[Any, _CPUCollectives]:
     collectives = _CPUCollectives(peer_empty_flags)
-    methods = _extract_methods(
-        PATCH_PATH.read_text(),
+    methods = patched_functions(
         SCHEDULER_PATH,
         {"_legacy_tensor_update_is_empty", "update_weights_from_tensor", "end_weight_update"},
     )
@@ -311,7 +234,7 @@ def _scheduler_bucket(payload: Any) -> _Request:
 @lru_cache(maxsize=1)
 def _tensor_lora_setter() -> Any:
     module = ast.parse("from __future__ import annotations\n")
-    module.body.extend(_extract_methods(PATCH_PATH.read_text(), LORA_PATH, {"set_lora_from_tensors"}))
+    module.body.extend(patched_functions(LORA_PATH, {"set_lora_from_tensors"}))
     ast.fix_missing_locations(module)
     namespace = {
         "dist": SimpleNamespace(get_rank=lambda: 0),
@@ -656,18 +579,45 @@ class TestLegacyWeightUpdateSessions(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("resume-memory", [event[0] for event in manager.events])
 
 
-class TestPatchMethodExtraction(unittest.TestCase):
-    def test_truncated_method_is_not_silently_tested(self) -> None:
-        patch = (
+class TestPatchSourceExtraction(unittest.TestCase):
+    source = "class Example:\n    def value(self):\n        value = 1\n        return value + 10\n"
+
+    def _patch(self, replacement: int = 2) -> str:
+        return (
             "diff --git a/example.py b/example.py\n"
+            f"index {_blob_hash(self.source)}..{'0' * 40} 100644\n"
             "--- a/example.py\n"
             "+++ b/example.py\n"
-            "@@ -1,2 +1,2 @@\n"
-            "     async def incomplete(self):\n"
-            "         await self.operation()\n"
+            "@@ -3 +3 @@\n"
+            "-        value = 1\n"
+            f"+        value = {replacement}\n"
         )
-        with self.assertRaisesRegex(AssertionError, "complete context"):
-            _extract_methods(patch, "example.py", {"incomplete"})
+
+    def test_zero_context_hunk_still_executes_complete_method(self) -> None:
+        source = _validated_source(self.source, self._patch(), "example.py")
+        method = extract_functions(source, "example.py", {"value"})[0]
+        module = ast.Module(body=[method], type_ignores=[])
+        namespace: dict[str, Any] = {}
+        exec(compile(module, "example.py", "exec"), namespace)
+        self.assertEqual(namespace["value"](object()), 12)
+
+    def test_already_patched_source_round_trips_against_current_hunks(self) -> None:
+        source = apply_file_patch(self.source, self._patch(), "example.py")
+        self.assertEqual(_validated_source(source, self._patch(), "example.py"), source)
+        with self.assertRaisesRegex(AssertionError, "Source does not match"):
+            _validated_source(source, self._patch(replacement=3), "example.py")
+
+    def test_wrong_source_outside_patch_context_is_rejected(self) -> None:
+        source = self.source.replace("return value + 10", "return value + 20")
+        with self.assertRaisesRegex(AssertionError, "Source does not match"):
+            _validated_source(source, self._patch(), "example.py")
+        source = apply_file_patch(source, self._patch(), "example.py")
+        with self.assertRaisesRegex(AssertionError, "target SGLang blob"):
+            _validated_source(source, self._patch(), "example.py")
+
+    def test_truncated_hunk_is_rejected(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "Inconsistent diff counts"):
+            apply_file_patch(self.source, self._patch().rsplit("+", 1)[0], "example.py")
 
 
 class TestSchedulerLegacyPadding(unittest.TestCase):

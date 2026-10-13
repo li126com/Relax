@@ -1,6 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import ast
+import dataclasses
+import os
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -81,6 +85,151 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     else:
         assert events == ["guard", "parent_check"]
         http_server.launch_server.assert_not_called()
+
+
+def _is_record_fields_import(node: ast.AST) -> bool:
+    return isinstance(node, ast.Try) and any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "sglang.srt.arg_groups.arg_utils"
+        and any(alias.name == "record_fields" for alias in statement.names)
+        for statement in node.body
+    )
+
+
+@pytest.fixture()
+def server_args_module() -> SimpleNamespace:
+    """Run complete argument builders with the real SGLang ServerArgs."""
+    from relax.utils.logging_utils import get_logger
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    repo_root = Path(__file__).resolve().parents[3]
+    source = repo_root / "relax/backends/sglang/sglang_engine.py"
+    functions = {"_compute_server_args", "_compute_genrm_server_args", "_enable_draft_weights_cpu_backup"}
+    imports = {"sglang.srt.arg_groups.arg_utils", "sglang.srt.server_args"}
+    nodes = [
+        node
+        for node in ast.parse(source.read_text()).body
+        if (isinstance(node, ast.FunctionDef) and node.name in functions)
+        or (isinstance(node, ast.ImportFrom) and node.module in imports)
+        or _is_record_fields_import(node)
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_EXTERNAL_ENGINE_SKIP_CHECK_FIELDS"
+                for target in node.targets
+            )
+        )
+    ]
+    peft_source = repo_root / "relax/utils/megatron_peft_utils.py"
+    nodes.extend(
+        node
+        for node in ast.parse(peft_source.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "is_lora_enabled"
+    )
+    namespace = {
+        "dataclasses": dataclasses,
+        "os": os,
+        "logger": get_logger(__name__),
+        "is_s3_uri": is_s3_uri,
+        "_to_local_gpu_id": lambda gpu_id: gpu_id,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    return SimpleNamespace(**namespace)
+
+
+@pytest.mark.parametrize("arg_utils_available", [False, True], ids=["missing-module", "missing-function"])
+def test_record_fields_import_falls_back_to_dataclasses(
+    monkeypatch: pytest.MonkeyPatch, arg_utils_available: bool
+) -> None:
+    source = Path(__file__).resolve().parents[3] / "relax/backends/sglang/sglang_engine.py"
+    nodes = [node for node in ast.parse(source.read_text()).body if _is_record_fields_import(node)]
+    assert len(nodes) == 1
+
+    for name in ("sglang", "sglang.srt", "sglang.srt.arg_groups"):
+        package = ModuleType(name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, name, package)
+    module_name = "sglang.srt.arg_groups.arg_utils"
+    monkeypatch.setitem(sys.modules, module_name, ModuleType(module_name) if arg_utils_available else None)
+
+    namespace = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    assert namespace["record_fields"] is dataclasses.fields
+
+
+def test_compute_server_args_accepts_installed_server_args(server_args_module: SimpleNamespace) -> None:
+    module = server_args_module
+
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=2,
+        num_gpus_per_node=8,
+        hf_checkpoint="/models/policy",
+        seed=17,
+        offload_rollout=True,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        sglang_ep_size=1,
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_mem_fraction_static=0.6,
+        sglang_attention_backend="flashinfer",
+        sglang_not_a_server_field=True,
+    )
+
+    kwargs, _ = module._compute_server_args(
+        args,
+        rank=0,
+        dist_init_addr="127.0.0.1:1234",
+        nccl_port=1235,
+        host="127.0.0.1",
+        port=1236,
+        base_gpu_id=0,
+        sglang_overrides={"mem_fraction_static": 0.7},
+    )
+
+    assert "not_a_server_field" not in kwargs
+    server_args = module.ServerArgs(**kwargs)
+    assert server_args.model_path == "/models/policy"
+    assert server_args.tp_size == 2
+    assert server_args.mem_fraction_static == 0.7
+    assert server_args.attention_backend == "flashinfer"
+    assert server_args.cuda_graph_backend_prefill == "disabled"
+
+
+def test_compute_genrm_server_args_accepts_installed_server_args(server_args_module: SimpleNamespace) -> None:
+    module = server_args_module
+
+    args = SimpleNamespace(
+        genrm_num_gpus_per_engine=2,
+        num_gpus_per_node=8,
+        genrm_model_path="/models/genrm",
+        seed=17,
+        offload_rollout=False,
+        genrm_engine_config={"attention_backend": "triton", "not_a_server_field": True},
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_mem_fraction_static=0.6,
+        sglang_attention_backend="flashinfer",
+        sglang_load_format="dummy",
+    )
+
+    kwargs, _ = module._compute_genrm_server_args(
+        args,
+        rank=0,
+        dist_init_addr="127.0.0.1:1234",
+        nccl_port=1235,
+        host="127.0.0.1",
+        port=1236,
+        base_gpu_id=0,
+    )
+
+    assert "not_a_server_field" not in kwargs
+    server_args = module.ServerArgs(**kwargs)
+    assert server_args.model_path == "/models/genrm"
+    assert server_args.tp_size == 2
+    assert server_args.mem_fraction_static == 0.6
+    assert server_args.attention_backend == "triton"
+    assert server_args.load_format == "auto"
 
 
 @pytest.mark.parametrize(
