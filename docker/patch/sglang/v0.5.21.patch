@@ -1786,7 +1786,7 @@ index 2791c3a4b4ab7814f4e5be3509dd8a13475b82e3..3bb77b04df94fed5b16b9e18f9d85f09
                      if self.profile_in_progress:
                          # force trace flush (a prefill capture must not absorb decode steps)
 diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
-index d9a11737328e0a757e85f21581823d235d33035c..df4eb427ee3bbc5ab51caa7dbee114af8ed26fff 100644
+index d9a11737328e0a757e85f21581823d235d33035c..8b3939fb67b15a9a3e0cd42696dd26a16dfa9d81 100644
 --- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
 +++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
 @@ -25,120 +25,121 @@
@@ -1911,7 +1911,7 @@ index d9a11737328e0a757e85f21581823d235d33035c..df4eb427ee3bbc5ab51caa7dbee114af
              if target_updated:
                  self.flush_cache_after_weight_update(recv_req)
              if success:
-@@ -157,251 +158,287 @@
+@@ -157,251 +158,289 @@
      def destroy_weights_update_group(
          self,
          recv_req: DestroyWeightsUpdateGroupReqInput,
@@ -2090,13 +2090,13 @@ index d9a11737328e0a757e85f21581823d235d33035c..df4eb427ee3bbc5ab51caa7dbee114af
              return EndWeightUpdateReqOutput(
                  success=False,
                  message="no weight-update session is open; call begin_weight_update() first",
-             )
++            )
 +        if self._session.relax_legacy and not self._session.loaded_weights:
 +            return EndWeightUpdateReqOutput(
 +                success=False,
 +                message="Legacy weight-update session received no weights; "
 +                "keep the engine paused and restart it",
-+            )
+             )
          run_post_load = not self._session.loaded_weights
          for _, runner in self._select_runners(self._session.selector):
              runner.weight_updater.end_weight_update(run_post_load=run_post_load)
@@ -2114,14 +2114,14 @@ index d9a11737328e0a757e85f21581823d235d33035c..df4eb427ee3bbc5ab51caa7dbee114af
  
          if tags is None or len(tags) == 0:
              tags = GPU_MEMORY_ALL_TYPES
-+
+ 
 +        if GPU_MEMORY_TYPE_KV_CACHE in tags:
 +            # Flush before publishing offload_tags or releasing any memory:
 +            # hybrid pool clears write GPU state, and flush_cache skips pools
 +            # once the KV tag is marked offloaded.
 +            flush_cache_success = self.flush_cache()
 +            assert flush_cache_success, "Cache flush failed before releasing KV memory"
- 
++
          for tag in tags:
              self.offload_tags.add(tag)
  
@@ -2139,6 +2139,8 @@ index d9a11737328e0a757e85f21581823d235d33035c..df4eb427ee3bbc5ab51caa7dbee114af
                      queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                      if queue is not None:
                          queue.release_memory_occupation()
++            # Cache-clearing kernels must finish before KV memory is unmapped.
++            torch.get_device_module().synchronize()
              self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
 -            self.flush_cache()
  
@@ -4149,10 +4151,19 @@ index fa5f9df2e61abe78b18efcdac5e7bd677666c94f..4dca344bb1193f553e9248fface3d38d
          return DecLockRefResult(delta=delta)
  
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 604a72f4ed7f1eddbe1088aabfb604ac808a47d5..604207fd60706d2f55d50a6a23dc427d446caaab 100644
+index 604a72f4ed7f1eddbe1088aabfb604ac808a47d5..4a13b0447f7416f0e9f33b6358c3b926be1c31cb 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -437,7 +437,8 @@
+@@ -282,6 +282,8 @@
+     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+     routed_experts_output: Optional[TopkCaptureOutput] = None
+     indexer_topk_output: Optional[TopkCaptureOutput] = None
++    # Actual per-rank token bucket replayed by this forward (None for eager).
++    graph_num_tokens: Optional[int] = None
+ 
+ 
+ def resolve_draft_attention_backend(
+@@ -437,7 +439,8 @@
          self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
  
          # CPU offload
@@ -4162,7 +4173,7 @@ index 604a72f4ed7f1eddbe1088aabfb604ac808a47d5..604207fd60706d2f55d50a6a23dc427d
  
          self._weight_checker = WeightChecker(get_model=lambda: self.model)
  
-@@ -1387,6 +1388,93 @@
+@@ -1387,6 +1390,93 @@
              lora_ref, tensors, config_dict, added_tokens_config
          )
  
@@ -4256,20 +4267,15 @@ index 604a72f4ed7f1eddbe1088aabfb604ac808a47d5..604207fd60706d2f55d50a6a23dc427d
      def unload_lora_adapter(self, lora_ref: LoRARef):
          """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
          return self.lora_manager.unload_lora_adapter(lora_ref)
-@@ -1767,6 +1855,12 @@
+@@ -1767,6 +1857,7 @@
          output.expert_distribution_metrics = recorder_outputs.get("metrics")
  
          no_copy_to_cpu = not get_schedule().disable_overlap_schedule
-+        cuda_graph_num_tokens = None
-+        decode_graph_runner = getattr(self, "decode_cuda_graph_runner", None)
-+        if getattr(decode_graph_runner, "bs", None):
-+            cuda_graph_num_tokens = decode_graph_runner.bs * getattr(
-+                decode_graph_runner, "num_tokens_per_bs", 1
-+            )
++        cuda_graph_num_tokens = output.graph_num_tokens
          if (
              not self.is_draft_worker
              and (experts_capturer := get_global_experts_capturer()) is not None
-@@ -1774,7 +1868,7 @@
+@@ -1774,7 +1865,7 @@
              output.routed_experts_output = experts_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -4278,7 +4284,7 @@ index 604a72f4ed7f1eddbe1088aabfb604ac808a47d5..604207fd60706d2f55d50a6a23dc427d
                  no_copy_to_cpu=no_copy_to_cpu,
              )
  
-@@ -1782,7 +1876,7 @@
+@@ -1782,7 +1873,7 @@
              output.indexer_topk_output = indexer_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -4287,8 +4293,127 @@ index 604a72f4ed7f1eddbe1088aabfb604ac808a47d5..604207fd60706d2f55d50a6a23dc427d
                  no_copy_to_cpu=no_copy_to_cpu,
              )
  
+@@ -1855,104 +1946,116 @@
+ 
+     def _forward_raw(
+         self,
+         forward_batch: ForwardBatch,
+         pp_proxy_tensors: Optional[PPProxyTensors],
+         reinit_attn_backend: bool = False,
+         split_forward_count: int = 1,
+     ) -> ModelRunnerOutput:
+         if has_forward_context():
+             ctx_mgr = contextlib.nullcontext()
+         else:
+             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+         with ctx_mgr:
+             mode_check = (
+                 forward_batch.forward_mode.is_cpu_graph
+                 if self.device == "cpu"
+                 else forward_batch.forward_mode.is_cuda_graph
+             )
+             can_run_graph = bool(
+                 mode_check()
+                 and self.decode_cuda_graph_runner
+                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+             )
+ 
+             if (
+                 forward_batch.forward_mode.is_decode()
+                 and self.hisparse_coordinator is not None
+             ):
+                 forward_batch.hisparse_coordinator = self.hisparse_coordinator
+                 self.hisparse_coordinator.wait_for_pending_backup()
+                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+ 
+             # Replay cuda graph if applicable
+             if can_run_graph:
+                 ret = self.decode_cuda_graph_runner.execute(
+                     forward_batch,
+                     pp_proxy_tensors=pp_proxy_tensors,
+                 )
+-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
++                return ModelRunnerOutput(
++                    logits_output=ret,
++                    can_run_graph=can_run_graph,
++                    graph_num_tokens=self.decode_cuda_graph_runner.bs
++                    * self.decode_cuda_graph_runner.captured_req_width,
++                )
++
++            graph_num_tokens = None
+ 
+             # DP / MLP-sync padding + attn-tp normalization. Only the decode
+             # cuda-graph path above pre-pads its static buffers and returns
+             # early; split prefill, the prefill cuda graph, and the eager
+             # forward all run the live batch and need this first — it sets
+             # global_dp_buffer_len / padded token counts that graph eligibility
+             # and the collectives depend on.
+             self._prepare_eager_forward_batch(forward_batch)
+ 
+             # Deferred mamba COW/clear on the forward stream, before the extend
+             # dispatch below reads the pool.
+             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+ 
+             dwdp_mgr = get_global_dwdp_manager()
+             if dwdp_mgr is not None:
+                 dwdp_mgr.prefetch_first_layers()
+ 
+             if forward_batch.forward_mode.is_split_prefill():
+                 # Layer-split mode; stays on ModelRunner, not the eager runner.
+                 ret = self.forward_split_prefill(
+                     forward_batch,
+                     reinit_attn_backend=reinit_attn_backend,
+                     forward_count=split_forward_count,
+                 )
+             elif (
+                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
+                 and self.prefill_cuda_graph_runner is not None
+                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
+                 and forward_batch.token_indices_to_pool is None
+                 and _prefill_cuda_graph_allows_context_parallel(
+                     self.prefill_cuda_graph_runner, forward_batch
+                 )
+             ):
+                 # Prefill cuda graph (piecewise).
+                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
+                 category = (
+                     "target_verify"
+                     if forward_batch.forward_mode.is_target_verify()
+                     else "extend"
+                 )
+                 # TODO: the timing here is too broad -- it also includes
+                 # load_batch time. Move it into the prefill cuda graph runner
+                 # to capture only the model.forward part.
+                 with device_timer_ctx(self.device_timer, category):
+                     ret = self.prefill_cuda_graph_runner.execute(
+                         forward_batch, **kwargs
+                     )
+                 can_run_graph = True
++                graph_num_tokens = self.prefill_cuda_graph_runner.last_replay_num_tokens
+             else:
+                 # Eager: decode / extend / idle dispatched inside the runner.
+                 ret = self.eager_runner.execute(
+                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                 )
+ 
+             if (
+                 forward_batch.global_num_tokens_cpu is not None
+                 and self.pp_group.is_last_rank
+             ):
+                 forward_batch.post_forward_mlp_sync_batch(ret)
+ 
+-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
++            return ModelRunnerOutput(
++                logits_output=ret,
++                can_run_graph=can_run_graph,
++                graph_num_tokens=graph_num_tokens,
++            )
+ 
+     def _preprocess_logits(
+         self,
 diff --git a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
-index 5d852a613675ac6f71e6cf919843efa9bd9cd312..9405841c3ca1995699f7e85175c769d3c5896666 100644
+index 5d852a613675ac6f71e6cf919843efa9bd9cd312..141c1ccf50e471b86292f0bf9e31d699eb7fe418 100644
 --- a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
 +++ b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
 @@ -306,15 +306,21 @@
@@ -4317,6 +4442,51 @@ index 5d852a613675ac6f71e6cf919843efa9bd9cd312..9405841c3ca1995699f7e85175c769d3
          )
  
      def load_weights_from_distributed(
+@@ -338,39 +344,43 @@
+ 
+     def update_weights_from_tensor(
+         self: WeightUpdater,
+         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
+         load_format: Optional[str] = None,
+     ):
+         error = _unsupported_derived_weight_cache_error(self.get_model())
+         if error is not None:
+             return False, error
+ 
+         monkey_patch_torch_reductions()
+         self._assert_weight_cache_inactive("update_weights_from_tensor")
+         if load_format == "flattened_bucket":
+             # Handle flattened bucket format
+-            return self._update_weights_from_flattened_bucket(
++            result = self._update_weights_from_flattened_bucket(
+                 flattened_tensor_bucket_dict=named_tensors
+             )
++            # The sender may reuse IPC storage as soon as this RPC returns.
++            torch.get_device_module(self.device).synchronize()
++            return result
+ 
+         # We need to get device after patch otherwise the device would be wrong
+         device_module = torch.get_device_module(self.device)
+         infered_device = device_module.current_device()
+ 
+         named_tensors = [
+             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+             for name, tensor in named_tensors
+         ]
+         if load_format == "direct":
+             _model_load_weights_direct(self.get_model(), named_tensors)
+         elif load_format in self.custom_weight_loaders:
+             custom_loader = dynamic_import(load_format)
+             custom_loader(self.get_model(), named_tensors)
+         elif load_format is None:
+             self.get_model().load_weights(named_tensors)
+         else:
+             raise NotImplementedError(f"Unknown load_format={load_format}")
++        device_module.synchronize()
+         return True, "Success"
+ 
+     def _update_weights_from_flattened_bucket(
+         self: WeightUpdater,
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
 index c28eb599fe0402ce8de0c5c4a4f89e65b66b7a8d..b3191d38ce2e9c9e501fc49ac67103c2e5e89225 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
@@ -4786,3 +4956,700 @@ index 543690c11321d76aa00914c26bd641c25ce4dba2..648c59144145ac93a21c00183efacd09
              forward_batch.req_pool_indices,
          ]
          if self.model_runner.model_config.model_is_mrope:
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+index 78c163f0c373a8dba5e0f6ba26f1e93d160d688f..0c237e8a1d75eb9736cbc0e6b2d177282e6a5992 100644
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -1178,14 +1178,17 @@
+     else:
+         if num_tokens <= 2048:
+             assert n_splits == 1
+-            if hc_hidden_size == 16384:
+-                hidden_block = 256
+-            elif hc_hidden_size == 28672:
+-                hidden_block = 128
++            split_size = hc_hidden_size // n_splits_pre
++            for hidden_block in (256, 128):
++                if (
++                    hc_hidden_size % hidden_block == 0
++                    and split_size % hidden_block == 0
++                ):
++                    break
+             else:
+                 raise NotImplementedError(
+-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
+-                    f"got {hc_hidden_size}"
++                    f"mhc_pre splitk kernel needs a hidden_block in {{256, 128}} that divides "
++                    f"hc_hidden_size // split_k = {split_size}, got hc_hidden_size={hc_hidden_size}"
+                 )
+             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
+                 hc_mult3,
+diff --git a/python/sglang/srt/layers/moe/hash_topk.py b/python/sglang/srt/layers/moe/hash_topk.py
+index d32c600ff200cfb880b64bf5ce9505775e24a8b4..5bc7869af84d4e1dbffb942251e0f147f270db01 100644
+--- a/python/sglang/srt/layers/moe/hash_topk.py
++++ b/python/sglang/srt/layers/moe/hash_topk.py
+@@ -20,6 +20,7 @@
+     TopKConfig,
+     _mask_topk_ids_padded_region,
+     _zero_topk_weights_padded_region,
++    capture_routed_experts_if_allowed,
+     remap_topk_for_per_rank_shared_slots,
+ )
+ from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+@@ -54,12 +55,26 @@
+         self.waterfill_balancer = None
+ 
+         if self.enable_waterfill:
++            # Routed-experts capture sizes its buffer by the model's fused
++            # shared-expert count, but under waterfill the ids captured here
++            # carry routed slots only, so the two widths disagree.
++            if get_exec().features.enable_return_routed_experts:
++                raise ValueError(
++                    "HashTopK cannot capture routed experts with waterfill enabled: "
++                    "disable --enable-waterfill or --enable-return-routed-experts."
++                )
+             # Waterfill appends the shared expert after EPLB maps routed IDs.
+             topk -= num_fused_shared_experts
+             num_fused_shared_experts = 0
+ 
+         self.num_experts = num_experts
+         self.topk = topk
++        self.topk_config = TopKConfig(
++            top_k=topk,
++            num_fused_shared_experts=num_fused_shared_experts,
++            routed_scaling_factor=routed_scaling_factor,
++            scoring_func=scoring_func,
++        )
+         self.routed_scaling_factor = routed_scaling_factor
+         self.num_fused_shared_experts = num_fused_shared_experts
+         self.score_func = scoring_func
+@@ -250,6 +265,13 @@
+         if self.apply_routed_scaling_factor_on_output:
+             topk_weights = topk_weights * self.routed_scaling_factor
+ 
++        capture_routed_experts_if_allowed(
++            self.topk_config,
++            self.layer_id,
++            topk_ids,
++            num_token_non_padded,
++        )
++
+         num_fused_shared_experts = self.num_fused_shared_experts
+         log2phy_prob = None
+         if (
+@@ -284,11 +306,7 @@
+                 topk_weights,
+                 num_fused_shared_experts,
+                 num_physical_routed_experts,
+-                TopKConfig(
+-                    top_k=self.topk,
+-                    num_fused_shared_experts=num_fused_shared_experts,
+-                    routed_scaling_factor=self.routed_scaling_factor,
+-                ),
++                self.topk_config,
+             )
+         else:
+             topk_ids = topk_ids_logical_to_physical(
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index a4b6541f64415b72246c0da664ea0142a2d56c0d..60767eb65bbbf613b1d06f41fcf4e7c597503b84 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -2206,21 +2206,31 @@
+ 
+ def capture_routed_experts_if_allowed(
+     topk_config: TopKConfig,
+     layer_id: Optional[int],
+     topk_ids: torch.Tensor,
++    num_token_non_padded: Optional[torch.Tensor] = None,
+ ) -> None:
+     """Single capture site for every backend, gated by the per-config opt-out.
+ 
+     Routing all backends through here keeps the draft-side opt-out from being
+     bypassed by an inlined capturer call.
++
++    Capture runs ahead of every padded-region mask in ``_post_process_topk_ids``
++    (and ROCm's masks to 0, a valid expert id), so mask a copy here: replay skips
++    -1 rows but reads a padded one as a real selection.
+     """
+     if not topk_config.allow_routed_experts_capture:
+         return
+-    if (cap := get_global_experts_capturer()) is not None:
+-        cap.capture(
+-            layer_id=layer_id,
+-            topk_indices=topk_ids,
+-        )
++    cap = get_global_experts_capturer()
++    if cap is None:
++        return
++    if num_token_non_padded is not None:
++        topk_ids = topk_ids.clone()
++        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
++    cap.capture(
++        layer_id=layer_id,
++        topk_indices=topk_ids,
++    )
+ 
+ 
+ def _post_process_topk_ids(
+@@ -2240,7 +2250,9 @@
+     fused_shared_experts_scaling_factor = (
+         topk_config.fused_shared_experts_scaling_factor
+     )
+-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
++    capture_routed_experts_if_allowed(
++        topk_config, layer_id, topk_ids, num_token_non_padded
++    )
+     recorder_topk_ids = None
+     _fold_pad_into_append = False
+     recorder_was_fused = False
+diff --git a/python/sglang/srt/layers/quantization/marlin_utils_fp4.py b/python/sglang/srt/layers/quantization/marlin_utils_fp4.py
+index 1a4b5d52699e2f9e7f608ec4a5823775440f0131..8cba3ca428686c01208b429dfb2b24fd0c77c1f3 100644
+--- a/python/sglang/srt/layers/quantization/marlin_utils_fp4.py
++++ b/python/sglang/srt/layers/quantization/marlin_utils_fp4.py
+@@ -13,6 +13,7 @@
+     should_use_atomic_add_reduce,
+ )
+ from sglang.srt.layers.quantization.utils import get_scalar_types
++from sglang.srt.layers.utils import copy_or_rebind_param
+ from sglang.srt.utils import is_cuda
+ from sglang.srt.utils.custom_op import register_custom_op
+ 
+@@ -258,7 +259,25 @@
+     return None
+ 
+ 
+-def deinterleave_moe_mxfp4_w13_for_marlin(layer: torch.nn.Module) -> None:
++def _view_tensor_storage(
++    tensor: torch.Tensor, shape: tuple[int, ...], dtype: torch.dtype
++) -> torch.Tensor:
++    if not tensor.is_contiguous():
++        raise ValueError("MXFP4 Marlin in-place reload requires contiguous parameters.")
++    expected_nbytes = torch.empty((), dtype=dtype).element_size()
++    for dim in shape:
++        expected_nbytes *= dim
++    if tensor.nbytes != expected_nbytes:
++        raise ValueError(
++            f"Cannot reuse {tensor.nbytes} bytes as shape={shape}, dtype={dtype} "
++            f"({expected_nbytes} bytes)."
++        )
++    return tensor.view(torch.uint8).reshape(-1).view(dtype).reshape(shape)
++
++
++def deinterleave_moe_mxfp4_w13_for_marlin(
++    layer: torch.nn.Module, reuse_parameter_storage: bool = False
++) -> None:
+     """Convert GPT-OSS interleaved w13 rows to Marlin's contiguous halves.
+ 
+     GPT-OSS stores gate/up rows as [gate0, up0, gate1, up1, ...]. The Marlin
+@@ -273,9 +292,21 @@
+         raise ValueError(f"Expected even w13 row dimension, got {w13.shape}.")
+ 
+     e, n, k = w13.shape
+-    layer.w13_weight.data = (
+-        w13.view(e, n // 2, 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
+-    )
++    # in-place reload works one expert at a time so the scratch stays one expert wide
++    if reuse_parameter_storage:
++        for expert_idx in range(e):
++            deinterleaved = (
++                w13[expert_idx]
++                .view(n // 2, 2, k)
++                .permute(1, 0, 2)
++                .contiguous()
++                .view(n, k)
++            )
++            w13[expert_idx].copy_(deinterleaved)
++    else:
++        layer.w13_weight.data = (
++            w13.view(e, n // 2, 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
++        )
+ 
+     if w13_scale is not None:
+         scale = w13_scale.data
+@@ -283,18 +314,38 @@
+             raise ValueError(
+                 f"Expected w13 scale row dimension {n}, got {scale.shape}."
+             )
+-        w13_scale.data = (
+-            scale.view(e, n // 2, 2, scale.shape[-1])
+-            .permute(0, 2, 1, 3)
+-            .contiguous()
+-            .view(e, n, scale.shape[-1])
+-        )
++        if reuse_parameter_storage:
++            for expert_idx in range(e):
++                deinterleaved = (
++                    scale[expert_idx]
++                    .view(n // 2, 2, scale.shape[-1])
++                    .permute(1, 0, 2)
++                    .contiguous()
++                    .view(n, scale.shape[-1])
++                )
++                scale[expert_idx].copy_(deinterleaved)
++        else:
++            w13_scale.data = (
++                scale.view(e, n // 2, 2, scale.shape[-1])
++                .permute(0, 2, 1, 3)
++                .contiguous()
++                .view(e, n, scale.shape[-1])
++            )
+ 
+     if w13_bias is not None:
+         bias = w13_bias.data
+         if bias.shape[1] != n:
+             raise ValueError(f"Expected w13 bias row dimension {n}, got {bias.shape}.")
+-        w13_bias.data = bias.view(e, n // 2, 2).permute(0, 2, 1).contiguous().view(e, n)
++        if reuse_parameter_storage:
++            for expert_idx in range(e):
++                deinterleaved = (
++                    bias[expert_idx].view(n // 2, 2).permute(1, 0).contiguous().view(n)
++                )
++                bias[expert_idx].copy_(deinterleaved)
++        else:
++            w13_bias.data = (
++                bias.view(e, n // 2, 2).permute(0, 2, 1).contiguous().view(e, n)
++            )
+ 
+ 
+ def _repack_moe_fp4_weight_for_marlin(
+@@ -343,7 +394,9 @@
+     return torch.stack(tensor_list)
+ 
+ 
+-def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
++def prepare_moe_mxfp4_layer_for_marlin(
++    layer: torch.nn.Module, reuse_parameter_storage: bool = False
++) -> None:
+     group_size = 32
+     w13 = layer.w13_weight.data
+     w2 = layer.w2_weight.data
+@@ -379,7 +432,13 @@
+     )
+ 
+     device = w13.device
+-    layer.workspace = marlin_make_workspace(device, 4)
++    if reuse_parameter_storage:
++        if not hasattr(layer, "workspace"):
++            raise ValueError(
++                "MXFP4 Marlin workspace is missing during in-place reload."
++            )
++    else:
++        layer.workspace = marlin_make_workspace(device, 4)
+     perm = torch.empty(0, dtype=torch.int, device=device)
+ 
+     def _pad_w13(x: torch.Tensor) -> torch.Tensor:
+@@ -398,15 +457,23 @@
+             x, (0, (padded_intermediate_size - intermediate_size) // packing)
+         )
+ 
++    # a padded reload would need storage the checkpoint-shaped parameters do not have
++    if reuse_parameter_storage and padded_intermediate_size != intermediate_size:
++        raise ValueError(
++            "MXFP4 Marlin in-place reload requires checkpoint parameters "
++            "to include Marlin padding."
++        )
++
+     w13 = _pad_w13(w13)
+     w2 = _pad_w2(w2, packing=2)
+-    w13_scale_data = _pad_w13(_normalize_scale_tensor(w13_scale_data, param_dtype))
+-    w2_scale_data = _pad_w2(
+-        _normalize_scale_tensor(w2_scale_data, param_dtype),
+-        packing=group_size,
+-    )
+-    if w13_bias_data is not None:
+-        w13_bias_data = _pad_w13(w13_bias_data.unsqueeze(-1)).squeeze(-1)
++    if not reuse_parameter_storage:
++        w13_scale_data = _pad_w13(_normalize_scale_tensor(w13_scale_data, param_dtype))
++        w2_scale_data = _pad_w2(
++            _normalize_scale_tensor(w2_scale_data, param_dtype),
++            packing=group_size,
++        )
++        if w13_bias_data is not None:
++            w13_bias_data = _pad_w13(w13_bias_data.unsqueeze(-1)).squeeze(-1)
+ 
+     w13_size_n, w13_size_k = padded_intermediate_size * 2, hidden_size
+     w2_size_n, w2_size_k = hidden_size, padded_intermediate_size
+@@ -421,6 +488,61 @@
+         for i in range(num_experts):
+             tensor_list.append(marlin_permute_bias(bias[i].to(param_dtype)))
+         return torch.stack(tensor_list)
++
++    def _transform_parameter_in_place(name: str, transform) -> None:
++        param = getattr(layer, name)
++        source = param.data
++        if source.shape[0] != num_experts:
++            raise ValueError(
++                f"Expected {num_experts} experts in {name}, got {source.shape}."
++            )
++
++        # expert i keeps its byte range, so writing it only overwrites bytes its transform read
++        first = transform(source[0])
++        output_shape = (num_experts, *first.shape)
++        output = _view_tensor_storage(source, output_shape, first.dtype)
++        output[0].copy_(first)
++        for expert_idx in range(1, num_experts):
++            output[expert_idx].copy_(transform(source[expert_idx]))
++        param.data = output
++
++    if reuse_parameter_storage:
++
++        def _repack_expert(size_n: int, size_k: int):
++            return lambda weight: _repack_moe_fp4_weight_for_marlin(
++                weight[None], num_experts=1, size_n=size_n, size_k=size_k, perm=perm
++            )[0]
++
++        def _permute_expert_scale(size_n: int, size_k: int):
++            return lambda scale: _permute_moe_fp4_scales_for_marlin(
++                _normalize_scale_tensor(scale, param_dtype)[None],
++                num_experts=1,
++                size_n=size_n,
++                size_k=size_k,
++                group_size=group_size,
++                process_scales=_process_scales,
++            )[0]
++
++        _transform_parameter_in_place(
++            "w13_weight", _repack_expert(w13_size_n, w13_size_k)
++        )
++        _transform_parameter_in_place("w2_weight", _repack_expert(w2_size_n, w2_size_k))
++        _transform_parameter_in_place(
++            "w13_weight_scale", _permute_expert_scale(w13_size_n, w13_size_k)
++        )
++        _transform_parameter_in_place(
++            "w2_weight_scale", _permute_expert_scale(w2_size_n, w2_size_k)
++        )
++        if w13_bias_data is not None:
++            _transform_parameter_in_place(
++                "w13_weight_bias",
++                lambda bias: marlin_permute_bias(bias.to(param_dtype)),
++            )
++        if w2_bias_data is not None:
++            _transform_parameter_in_place(
++                "w2_weight_bias", lambda bias: marlin_permute_bias(bias.to(param_dtype))
++            )
++        return
+ 
+     w13_marlin = _repack_moe_fp4_weight_for_marlin(
+         w13, num_experts=num_experts, size_n=w13_size_n, size_k=w13_size_k, perm=perm
+@@ -445,19 +567,16 @@
+         process_scales=_process_scales,
+     )
+ 
+-    layer.w13_weight = torch.nn.Parameter(w13_marlin, requires_grad=False)
+-    layer.w2_weight = torch.nn.Parameter(w2_marlin, requires_grad=False)
+-    layer.w13_weight_scale = torch.nn.Parameter(w13_scale_marlin, requires_grad=False)
+-    layer.w2_weight_scale = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
++    # rebinding keeps the Parameter objects, and with them the weight_loader a reload needs
++    copy_or_rebind_param(layer, "w13_weight", w13_marlin)
++    copy_or_rebind_param(layer, "w2_weight", w2_marlin)
++    copy_or_rebind_param(layer, "w13_weight_scale", w13_scale_marlin)
++    copy_or_rebind_param(layer, "w2_weight_scale", w2_scale_marlin)
+ 
+     if w13_bias_data is not None:
+-        layer.w13_weight_bias = torch.nn.Parameter(
+-            _permute_bias(w13_bias_data), requires_grad=False
+-        )
++        copy_or_rebind_param(layer, "w13_weight_bias", _permute_bias(w13_bias_data))
+     if w2_bias_data is not None:
+-        layer.w2_weight_bias = torch.nn.Parameter(
+-            _permute_bias(w2_bias_data), requires_grad=False
+-        )
++        copy_or_rebind_param(layer, "w2_weight_bias", _permute_bias(w2_bias_data))
+ 
+     # Marlin uses the repacked scales; release the loader-format parameters.
+     for stale in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
+index 52503455e0765cd92447e598bdceb454216c1bf1..abc87b1fd65b5c1481496213bf386a038476f704 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
+@@ -46,6 +46,14 @@
+     """MXFP4 (E8M0 scales) MoE quantization method using the Marlin backend."""
+ 
+     fuse_routed_scaling_factor_in_topk = True
++    # The loader writes the scales as *_weight_scale_inv (as for Fp8MoEMethod); Marlin keeps
++    # the repacked scales as *_weight_scale.
++    _LOADER_TO_RUNTIME_NAMES = {
++        "w13_weight": "w13_weight",
++        "w13_weight_scale_inv": "w13_weight_scale",
++        "w2_weight": "w2_weight",
++        "w2_weight_scale_inv": "w2_weight_scale",
++    }
+ 
+     def __init__(self, fp8_method, prefix: str):
+         self._fp8 = fp8_method
+@@ -127,44 +135,116 @@
+         layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+         set_weight_attrs(w2_weight_scale, scale_attrs)
+ 
++        layer._mxfp4_marlin_scale_attrs = scale_attrs
++        layer._mxfp4_marlin_checkpoint_parameter_specs = {
++            name: (tuple(getattr(layer, name).shape), getattr(layer, name).dtype)
++            for name in self._LOADER_TO_RUNTIME_NAMES
++        }
++        layer._mxfp4_marlin_runtime_parameter_specs = None
++        layer._mxfp4_marlin_reload_in_place = False
++
++    def restore_weights_before_loading(self, layer: Module) -> None:
++        if layer._mxfp4_marlin_reload_in_place:
++            return
++        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
++            _view_tensor_storage,
++        )
++
++        # A weight update loads the checkpoint layout into the Marlin storage and repacks it there:
++        # CUDA graphs and the memory saver hold these parameters' addresses.
++        runtime_specs = layer._mxfp4_marlin_runtime_parameter_specs
++        if runtime_specs is None:
++            raise RuntimeError(
++                f"MXFP4 Marlin weights of {self.prefix} were never post-processed."
++            )
++        for loader_name, runtime_name in self._LOADER_TO_RUNTIME_NAMES.items():
++            shape, dtype = layer._mxfp4_marlin_checkpoint_parameter_specs[loader_name]
++            param = getattr(layer, runtime_name)
++            current_spec = (tuple(param.shape), param.dtype)
++            if current_spec not in ((shape, dtype), runtime_specs[runtime_name]):
++                raise ValueError(
++                    f"Unexpected MXFP4 Marlin parameter state for {runtime_name}: "
++                    f"shape={param.shape}, dtype={param.dtype}."
++                )
++            # the loader fills only the unpadded slice, so the padding must start at zero
++            param.data = _view_tensor_storage(param.data, shape, dtype)
++            param.data.zero_()
++            if loader_name != runtime_name:
++                # the loader looks the scales up by their checkpoint name
++                alias = torch.nn.Parameter(param.data, requires_grad=False)
++                set_weight_attrs(alias, layer._mxfp4_marlin_scale_attrs)
++                alias.format_ue8m0 = False
++                layer.register_parameter(loader_name, alias)
++        layer._mxfp4_marlin_reload_in_place = True
++
+     def process_weights_after_loading(self, layer: Module) -> None:
++        if (
++            layer._mxfp4_marlin_runtime_parameter_specs is not None
++            and not layer._mxfp4_marlin_reload_in_place
++        ):
++            return
+         from sglang.srt.layers.quantization.marlin_utils import (
+             check_moe_marlin_supports_layer,
+         )
+         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+             deinterleave_moe_mxfp4_w13_for_marlin,
+             prepare_moe_mxfp4_layer_for_marlin,
+         )
+ 
+         # Let the FP8 base method handle ROCm normalization, etc.
+         self._fp8.process_weights_after_loading(layer)
+ 
+         if getattr(layer, "_mega_moe_weights_built", False):
+             return
+ 
+         if not get_platform().is_sm90 and not get_platform().is_sm120:
+             raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+ 
+         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
+             raise RuntimeError(
+                 "Current MXFP4 MoE layer does not satisfy Marlin constraints."
+             )
+ 
+         # NOTE: the Marlin MoE runner consumes w13 in the checkpoint's
+         # native ``[w1; w3]`` order -- see ``silu_and_mul`` in
+         # fused_marlin_moe.py which expects ``gate = intermediate[:, :N]``
+         # (first half) and ``up = intermediate[:, N:]`` (second half).
+         # Unlike the flashinfer trtllm_fp4 kernel (which wants [w3, w1]),
+         # we must *not* call ``reorder_w1w3_to_w3w1`` here.
+ 
++        reuse_parameter_storage = layer._mxfp4_marlin_reload_in_place
++        if reuse_parameter_storage:
++            # the repack works on the runtime names, which share storage with these aliases
++            for loader_name, runtime_name in self._LOADER_TO_RUNTIME_NAMES.items():
++                if loader_name != runtime_name:
++                    delattr(layer, loader_name)
++
+         log_info_on_rank0(
+             logger,
+             f"Preparing MXFP4 experts for Marlin backend (layer: {self.prefix})...",
+         )
+         if self.runner.config.gemm1_alpha is not None:
+-            deinterleave_moe_mxfp4_w13_for_marlin(layer)
+-        prepare_moe_mxfp4_layer_for_marlin(layer)
++            deinterleave_moe_mxfp4_w13_for_marlin(
++                layer, reuse_parameter_storage=reuse_parameter_storage
++            )
++        prepare_moe_mxfp4_layer_for_marlin(
++            layer, reuse_parameter_storage=reuse_parameter_storage
++        )
++
++        runtime_specs = {
++            name: (tuple(getattr(layer, name).shape), getattr(layer, name).dtype)
++            for name in self._LOADER_TO_RUNTIME_NAMES.values()
++        }
++        if reuse_parameter_storage:
++            if runtime_specs != layer._mxfp4_marlin_runtime_parameter_specs:
++                raise ValueError(
++                    "MXFP4 Marlin in-place reload changed the runtime layout: "
++                    f"{runtime_specs} vs {layer._mxfp4_marlin_runtime_parameter_specs}."
++                )
++        else:
++            layer._mxfp4_marlin_runtime_parameter_specs = runtime_specs
++        layer._mxfp4_marlin_reload_in_place = False
+         layer._dsv4_mxfp4_backend = "marlin"
+ 
+     def apply(
+         self,
+diff --git a/python/sglang/srt/models/deepseek_v4_nextn.py b/python/sglang/srt/models/deepseek_v4_nextn.py
+index 6694abb603a8cda9e5a2b12d1ce29d731ce90a3a..0948c5fe84e22258c6b37d6dcec5c0851ded4155 100644
+--- a/python/sglang/srt/models/deepseek_v4_nextn.py
++++ b/python/sglang/srt/models/deepseek_v4_nextn.py
+@@ -256,6 +256,7 @@
+ 
+     def post_load_weights(self, is_nextn=False, weight_names=None):
+         super().post_load_weights(is_nextn=True, weight_names=weight_names)
++        self.model.decoder.self_attn.refresh_attn_sink_cache()
+ 
+ 
+ EntryClass = [DeepseekV4ForCausalLMNextN]
+diff --git a/python/sglang/srt/state_capturer/base.py b/python/sglang/srt/state_capturer/base.py
+index f451f7e6f5d2c92098ceaa7c35eebd9b77264c17..dcfd7fd42e17f0fb4f7f661eb4d18f710e544db7 100644
+--- a/python/sglang/srt/state_capturer/base.py
++++ b/python/sglang/srt/state_capturer/base.py
+@@ -189,33 +189,34 @@
+ 
+     def on_forward_end(
+         self,
+         forward_batch: ForwardBatch,
+         can_run_graph: bool,
+         cuda_graph_batch: Optional[int],
+         no_copy_to_cpu: bool = False,
+     ) -> Optional[TopkCaptureOutput]:
+         """If no_copy_to_cpu is True, return a TopkCaptureOutput holding GPU tensors so
+         the overlap thread can do non-blocking D2H + finalize itself. Otherwise sync
+         D2H inline and return None (legacy non-overlap path).
+         """
+         slice_gpu = self._get_local_slice(
+             forward_batch, can_run_graph, cuda_graph_batch
+         )
+         # get_topk reads req_to_token IDs; attention may have rebound the write
+         # loc to kernel-facing IDs, which are neither stable nor the same space.
+         out_cache_loc = forward_batch.out_cache_loc_virtual
+         if out_cache_loc is None:
+             out_cache_loc = forward_batch.out_cache_loc
+         else:
+             # Kernel batches may be padded; only real request tokens are stored.
+             slice_gpu = slice_gpu[: out_cache_loc.shape[0]]
++        out_cache_loc = out_cache_loc[: slice_gpu.shape[0]]
+         if no_copy_to_cpu:
+             # Clone before the next overlapping forward reuses these buffers.
+             return TopkCaptureOutput(
+                 out_cache_loc=out_cache_loc.clone(),
+                 topk=slice_gpu.clone(),
+                 host_cache=self.host_cache,
+             )
+         out_cache_loc_cpu = out_cache_loc.cpu()
+         self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
+         return None
+diff --git a/python/sglang/srt/state_capturer/routed_experts.py b/python/sglang/srt/state_capturer/routed_experts.py
+index fab5c4d9207e4e95a43818a869bd83876d17fd4f..309bd4853ae9bc9f12481b1108a673b74abe6a2c 100644
+--- a/python/sglang/srt/state_capturer/routed_experts.py
++++ b/python/sglang/srt/state_capturer/routed_experts.py
+@@ -11,6 +11,7 @@
+     is_dp_attention_enabled,
+ )
+ from sglang.srt.layers.moe import get_moe_a2a_backend
++from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.runtime_context import (
+     get_exec,
+@@ -30,10 +31,9 @@
+ class RoutedExpertsCapturer(BaseTopkCapturer):
+     """Capturer for routed experts with host buffer.
+ 
+-    Routed experts share a global device buffer across DP ranks (indexed by
+-    dp_rank), so `_get_local_slice` overrides the default to apply DP-rank-aware
+-    slicing. The device cache also holds extra columns for any fused shared
+-    experts; the host cache and user-facing return drop them via the
++    DP-concatenated routing needs a DP-rank offset at readback; DP-local routing
++    already starts at buffer offset zero. The device cache holds extra columns
++    for fused shared experts; the host cache and user-facing return drop them via the
+     [:topk_size] truncation.
+     """
+ 
+@@ -116,22 +116,22 @@
+ 
+     def _get_local_slice(
+         self,
+         forward_batch: ForwardBatch,
+         can_run_graph: bool,
+         cuda_graph_batch: Optional[int],
+     ) -> torch.Tensor:
+-        # Gathered rows start at buffer offset zero on every DP rank.
+-        if is_dp_attention_enabled() and not _is_scattered_a2a_backend():
++        # DP-local routing and attention-TP gathered rows both start at zero.
++        if is_dp_attention_enabled() and not is_moe_input_scattered_across_dp_ranks():
+             # GPU->CPU sync would break overlap; operate on CPU directly.
+             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
+                 forward_batch, can_run_graph, cuda_graph_batch
+             )
+             local_end_pos = local_start_pos + local_num_tokens
+         else:
+             local_start_pos, local_end_pos = 0, forward_batch.out_cache_loc.shape[0]
+         return self.device_cache.buffer[
+             local_start_pos:local_end_pos, :, : self.topk_size
+         ]
+ 
+ 
+ def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:
+@@ -163,15 +163,14 @@
+ 
+ def disable_routed_experts_capture_for_draft(model: Any) -> None:
+     """Opt every draft MoE ``TopK`` out of routed-experts (R3) capture.
+ 
+-    Capture is target-only; a draft ``TopK`` must never write the target's
+-    process-global buffer. ``HashTopK`` has no ``topk_config`` and never
+-    captures, so it is left untouched.
++    Capture is target-only; draft ``TopK`` and ``HashTopK`` modules must never
++    write the target's process-global buffer.
+     """
+-    # Lazy import: ``layers.moe.topk`` imports ``get_global_experts_capturer``
+-    # from this module, so a top-level import here would be circular.
++    # Lazy imports avoid circular dependencies with the capture call sites.
++    from sglang.srt.layers.moe.hash_topk import HashTopK
+     from sglang.srt.layers.moe.topk import TopK
+ 
+     for module in model.modules():
+-        if isinstance(module, TopK):
++        if isinstance(module, (TopK, HashTopK)):
+             module.topk_config.allow_routed_experts_capture = False
+diff --git a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+index 1b506b826c7e1837bb2e60e6faef582c129e3b69..d429e95bf30c12fb4ae96ef82ce02b6926231d25 100644
+--- a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+@@ -2103,6 +2103,9 @@
+         with self.backend.replay_session():
+             static_forward_batch = self.load_batch(forward_batch, **kwargs)
+             static_num_tokens = len(static_forward_batch.input_ids)
++            # Stride of the dp-gathered buffer for this replay; surfaced through
++            # ModelRunnerOutput.graph_num_tokens.
++            self.last_replay_num_tokens = static_num_tokens
+             raw_num_tokens = self.raw_num_tokens
+             shape_key = self._shape_key(static_num_tokens, forward_batch)
+             # The only variants this runner records are chunked-prefix ones.
+diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
+index 788ac19b8cde3f6ae7732949cfb95073384f74fe..32ef3cd0d1b905d64e97f2d63f00a536dd61797c 100644
+--- a/python/sglang/srt/model_loader/loader.py
++++ b/python/sglang/srt/model_loader/loader.py
+@@ -1083,11 +1083,12 @@
+     @staticmethod
+     def restore_weights_before_loading(model, target_device):
+         """Undo in-place quant packing so fresh weights can be loaded."""
+         for module, quant_method in _modules_with_quant_method(model):
+-            # AMX packing and the MXFP4 backend wrappers are duck-typed and cannot restore
+-            if isinstance(quant_method, QuantizeMethodBase):
++            # MXFP4 Marlin is duck-typed but supplies the same restore hook.
++            restore = getattr(quant_method, "restore_weights_before_loading", None)
++            if callable(restore):
+                 with device_loading_context(module, target_device):
+-                    quant_method.restore_weights_before_loading(module)
++                    restore(module)
+ 
+ 
+ class LayeredModelLoader(DefaultModelLoader):
