@@ -48,7 +48,8 @@ RUN MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps \
     git clone --recurse-submodules https://github.com/deepseek-ai/FlashMLA.git /opt/FlashMLA && \
     cd /opt/FlashMLA && git checkout ${FLASH_MLA_COMMIT} && \
     git submodule update --init --recursive && \
-    MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps . && \
+    CPLUS_INCLUDE_PATH="${CUDA_HOME:-/usr/local/cuda}/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}" \
+        MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps . && \
     cd / && python -c "import flash_mla; assert hasattr(flash_mla, 'flash_mla_sparse_fwd'), \
         'flash_mla built but flash_mla_sparse_fwd missing'" && \
     rm -rf /opt/FlashMLA
