@@ -54,17 +54,10 @@ RUN MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps \
         'flash_mla built but flash_mla_sparse_fwd missing'" && \
     rm -rf /opt/FlashMLA
 
-# FA3 (Hopper flash-attention), built from source. This commit's _flash_attn_forward carries
-# window_size_left/right to match TE 2.14.1 (docs/draft/sglang-0.5.12-upgrade-plan.md §8.4).
-# The `cp` exposes flash_attn_3.flash_attn_interface, which is what TE imports. BUT this commit's
-# setup.py (py_modules=["flash_attn_interface"]) ALSO installs a *top-level* flash_attn_interface.py
-# (into the egg root). That top-level module and the copied flash_attn_3/flash_attn_interface.py
-# both register the torch custom op flash_attn_3::_flash_attn_forward; a second import in the same
-# process _destroy()s the Library TE bound to, so a later dispatch reads an empty schema
-# (use-after-free) and every actor forward crashes with `schema_.has_value() INTERNAL ASSERT
-# FAILED` (§8.5). Strip the stray top-level module (site-packages root + egg root). Keep
-# flash_attn_config.py: flash_attn_3/flash_attn_interface.py does `from flash_attn_config import
-# CONFIG` at forward time, so deleting it would break the forward with ModuleNotFoundError.
+# FA3 (Hopper flash-attention), built against the base Torch/CUDA ABI.
+# TE 2.18 imports flash_attn_interface; existing callers use flash_attn_3.
+# Alias both names to one module so its Torch custom ops are registered once.
+# Keep flash_attn_config.py, which the interface imports during forward.
 RUN MAX_JOBS=64 \
     cd /opt && git clone https://github.com/Dao-AILab/flash-attention.git && \
     cd flash-attention/ && \
@@ -77,10 +70,14 @@ RUN MAX_JOBS=64 \
     cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py && \
     find $python_path -maxdepth 1 -name flash_attn_interface.py -delete && \
     find $python_path -maxdepth 2 -path '*.egg/flash_attn_interface.py' -delete && \
-    cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'stray top-level flash_attn_interface still importable'; import flash_attn_config" && \
+    printf '%s\n' 'import sys' 'from flash_attn_3 import flash_attn_interface' \
+        'sys.modules[__name__] = flash_attn_interface' > "$python_path/flash_attn_interface.py" && \
+    cd / && python -c "import flash_attn_interface as top; from flash_attn_3 import flash_attn_interface as fa3; assert top is fa3; import flash_attn_config" && \
     rm -rf /opt/flash-attention/
 
-RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[core_cu13,pytorch]==2.14.1" && \
+# TE 2.18 defers optional cuBLAS symbol resolution for CUDA 13.0 compatibility.
+RUN NVTE_PYTORCH_FORCE_BUILD=TRUE MAX_JOBS=32 \
+    pip -v install --no-cache-dir --no-build-isolation "transformer_engine[core_cu13,pytorch]==2.18.0" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall --no-deps && \
     pip install "nvidia-modelopt==0.44.0" --no-build-isolation --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
@@ -202,5 +199,16 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     rm sglang.patch sglang_per_pos_topk.patch; \
 fi
 
+# Resolve training dependency constraints after all other package installs.
+# grpcio-tools must stay on protobuf 6 alongside CUTLASS and gRPC health/reflection.
+RUN pip install --no-cache-dir packaging==25.0 protobuf==6.33.6 grpcio-tools==1.81.1 \
+        hydra-core==1.3.2 typeguard==4.6.0 pillow==11.3.0 imageio==2.38.1
+
 # Restore the official DeepEP runtime after Torch's NCCL dependency resolution.
 RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7
+
+# TE can load NCCL before Torch; prefer the restored wheel over the system library.
+ENV LD_LIBRARY_PATH=/opt/sglang/lib/python${PYVER}/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH}
+
+# TE/SGLang imports need the host driver; run this check in the built container.
+COPY docker/scripts/check_gpu_imports.py /opt/relax/check_gpu_imports.py
