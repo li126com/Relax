@@ -55,12 +55,15 @@ class DeepSeekV41Bridge(MegatronModelBridge):
         text["torch_dtype"] = text.get("dtype") or text.get("torch_dtype") or "bfloat16"
         provider = super().provider_bridge(SimpleNamespace(config=SimpleNamespace(**text)))
         provider.v41_hf_config = hf_config_dict(hf_pretrained.config)
+        provider.v41_hf_checkpoint = getattr(hf_pretrained, "model_name_or_path", None)
         provider.experimental_attention_variant = None
         provider.multi_latent_attention = True
         provider.normalization = "RMSNorm"
         provider.qk_layernorm = True
         provider.add_bias_linear = False
         provider.add_qkv_bias = False
+        provider.hidden_dropout = 0.0
+        provider.attention_dropout = text.get("attention_dropout", 0.0)
         provider.rotary_percent = 1.0
         rope = text.get("rope_scaling") or text.get("rope_parameters") or {}
         main_rope = rope.get("main", {}) if "compress" in rope else rope

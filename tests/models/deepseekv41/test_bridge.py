@@ -178,8 +178,8 @@ def test_normalize_text_config_rejects_other_models() -> None:
 
 @pytest.mark.parametrize("flattened", [False, True])
 def test_hf_config_registration_round_trip(checkpoint_config: dict[str, Any], tmp_path: Path, flattened: bool) -> None:
-    register_hf_config()
-    register_hf_config()  # Multiple actor imports must be harmless.
+    register_hf_config(for_training=True)
+    register_hf_config(for_training=True)  # Multiple actor imports must be harmless.
     raw = _flatten_checkpoint(checkpoint_config) if flattened else checkpoint_config
     config = DeepSeekV41Config(**deepcopy(raw))
     config.save_pretrained(tmp_path)
@@ -202,6 +202,27 @@ def test_hf_config_is_pickleable_for_actor_transfer(checkpoint_config: dict[str,
     assert isinstance(restored, DeepSeekV41Config)
     assert isinstance(restored.text_config, DeepSeekV41TextConfig)
     assert restored.to_dict() == config.to_dict()
+
+
+def test_training_registration_restores_rollout_override_without_rebinding_config(
+    monkeypatch: pytest.MonkeyPatch, checkpoint_config: dict[str, Any]
+) -> None:
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from relax.models.deepseekv41 import configuration
+
+    class RolloutOnlyConfig(transformers.PretrainedConfig):
+        model_type = "deepseek_v41"
+
+    original = configuration.DeepSeekV41Config
+    monkeypatch.setitem(CONFIG_MAPPING._extra_content, "deepseek_v41", RolloutOnlyConfig)
+    register_hf_config()
+    assert CONFIG_MAPPING["deepseek_v41"] is RolloutOnlyConfig
+    assert configuration.DeepSeekV41Config is original
+    register_hf_config(for_training=True)
+    assert CONFIG_MAPPING["deepseek_v41"] is original
+    config = original(**deepcopy(checkpoint_config))
+    assert type(pickle.loads(pickle.dumps(config))) is original
 
 
 def test_autobridge_selects_v41_provider_without_hf_model_instantiation(checkpoint_config: dict[str, Any]) -> None:
@@ -248,6 +269,8 @@ def test_provider_uses_text_architecture_without_mutating_hf_config(
     assert provider.mtp_num_layers is None
     assert provider.experimental_attention_variant is None
     assert provider.rotary_percent == 1.0
+    assert provider.hidden_dropout == 0.0
+    assert provider.attention_dropout == 0.0
     assert provider.rotary_scaling_factor == 2
     assert (provider.mscale, provider.mscale_all_dim) == (1.0, 1.0)
     assert provider.v41_hc_eps == 1e-6
@@ -291,9 +314,9 @@ def test_provider_rejects_invalid_v41_compression_ratios(
         bridge.provider_bridge(SimpleNamespace(config=source))
 
 
-def test_provider_rejects_wrong_v4_execution_fallback(bridge: DeepSeekV41Bridge) -> None:
+def test_provider_rejects_unsupported_execution_geometry(bridge: DeepSeekV41Bridge) -> None:
     provider = bridge.provider_bridge(SimpleNamespace(config=bridge.hf_config))
-    with pytest.raises(NotImplementedError, match="execution.*not ported"):
+    with pytest.raises(ValueError, match="kernels require kv_lora_rank=512"):
         provider.provide(pre_process=True, post_process=True, vp_stage=None)
     with pytest.raises(ValueError, match="MTP/DSpark"):
         configure_runtime(provider, SimpleNamespace(mtp_num_layers=1))
@@ -629,3 +652,6 @@ def test_downloaded_checkpoint_dispatches_without_loading_model_weights() -> Non
     assert provider.params_dtype == torch.bfloat16
     provider.tensor_model_parallel_size = 2
     provider.finalize()
+    assert provider.hidden_dropout == 0.0
+    assert provider.attention_dropout == text.get("attention_dropout", 0.0)
+    assert str(provider.v41_hf_checkpoint) == checkpoint

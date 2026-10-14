@@ -2094,6 +2094,31 @@ def _compute_server_args(
         for key in unused_keys:
             kwargs.pop(key)
 
+    from relax.models.deepseekv41.checkpoint import validate_bf16_checkpoint
+
+    known_v41 = validate_bf16_checkpoint(args.hf_checkpoint)
+    is_v41 = (
+        known_v41
+        if kwargs["model_path"] == args.hf_checkpoint
+        else validate_bf16_checkpoint(kwargs["model_path"], require_v41=known_v41)
+    )
+    if is_v41:
+        if kwargs.get("dtype") not in (None, "auto", "bfloat16"):
+            raise ValueError("DeepSeek V4.1 BF16 rollout requires dtype auto or bfloat16.")
+        if kwargs.get("quantization") is not None:
+            raise ValueError("DeepSeek V4.1 BF16 rollout does not support a SGLang quantization override.")
+        if kwargs.get("load_format") == "dummy":
+            raise ValueError("DeepSeek V4.1 cannot use dummy loading: frozen Engram tables are not weight-synced.")
+        if kwargs.get("enable_memory_saver") and kwargs.get("enable_weights_cpu_backup") is not True:
+            from sglang.srt.environ import envs
+
+            host_table = getattr(envs, "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE", None)
+            if host_table is None or not host_table.get():
+                raise ValueError(
+                    "DeepSeek V4.1 memory saving requires SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 "
+                    "or explicit --sglang-enable-weights-cpu-backup to preserve frozen Engram tables."
+                )
+
     return kwargs, external_engine_need_check_fields
 
 

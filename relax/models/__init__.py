@@ -63,7 +63,7 @@ except Exception as _e:
 
 # Register V4.1's configuration and text-weight conversion before AutoBridge dispatch.
 try:
-    from relax.models import deepseekv41  # noqa: F401
+    from relax.models.deepseekv41 import DeepSeekV41Bridge  # noqa: F401
 except Exception as _e:
     from relax.utils.logging_utils import get_logger
 

@@ -94,11 +94,13 @@ def _init_hf_config(self: Any, text_config: Any = None, **kwargs: Any) -> None:
         self.text_config = config_class(**hf_config_dict(text_config))
 
 
-def register_hf_config() -> None:
+def register_hf_config(*, for_training: bool = False) -> None:
     """Register configuration-only fallbacks; no HF model implementation is needed.
 
     Keep Transformers optional until this model package is imported. Binding the
     fallback classes at module scope also makes their instances pickleable.
+    SGLang registers its own flattened config for rollout; only training entry
+    points explicitly restore our composite-aware registration after those imports.
     """
     from transformers import AutoConfig, PretrainedConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
@@ -107,20 +109,27 @@ def register_hf_config() -> None:
         ("deepseek_v41_text", "DeepSeekV41TextConfig"),
         ("deepseek_v41", "DeepSeekV41Config"),
     ):
-        if model_type in CONFIG_MAPPING:
-            config_class = CONFIG_MAPPING[model_type]
-        else:
+        config_class = globals().get(name)
+        if config_class is None and model_type in CONFIG_MAPPING:
+            candidate = CONFIG_MAPPING[model_type]
+            if candidate.__module__.startswith("transformers.models."):
+                config_class = candidate
+        if config_class is None:
             attributes: dict[str, Any] = {"model_type": model_type, "__module__": __name__}
             attributes["__init__"] = _init_hf_config
             config_class = type(name, (PretrainedConfig,), attributes)
-            AutoConfig.register(model_type, config_class)
         globals()[name] = config_class
+        if for_training or model_type not in CONFIG_MAPPING:
+            AutoConfig.register(model_type, config_class, exist_ok=True)
 
 
 def configure_runtime(provider: Any, args: Namespace) -> None:
     """Keep unsupported auxiliary architectures out of the text-only provider."""
+    from .execution_config import configure_execution_runtime
+
     if getattr(args, "mtp_num_layers", None):
         raise ValueError(
             "DeepSeek V4.1 currently follows Miles' text-only recipe; MTP/DSpark training is unsupported."
         )
     provider.mtp_num_layers = None
+    configure_execution_runtime(provider, args)

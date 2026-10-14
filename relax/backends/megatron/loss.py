@@ -126,6 +126,7 @@ def get_responses(
     else:
         assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
+    bshd_local_length = logits.size(1) if qkv_format == "bshd" else None
 
     if qkv_format == "thd":
         assert logits.size(0) == 1, f"{logits.shape}"
@@ -159,9 +160,12 @@ def get_responses(
                 logits_chunk = logits[start - 1 : end - 1]
                 tokens_chunk = tokens[total_length - response_length : total_length]
         elif args.allgather_cp:
-            # DSA: global concat then contiguous CP split. Each rank owns logits for
-            # global positions [chunk_start, chunk_end).
-            logits_local_len = logits.size(0)
+            # THD owns one global concatenation; BSHD owns the same contiguous
+            # position range independently in every batch row.
+            logits_local_len = bshd_local_length if qkv_format == "bshd" else logits.size(0)
+            sample_logits = (
+                logits[i * logits_local_len : (i + 1) * logits_local_len] if qkv_format == "bshd" else logits
+            )
             cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
             chunk_start = cp_rank * logits_local_len
             chunk_end = chunk_start + logits_local_len
@@ -175,10 +179,10 @@ def get_responses(
             s = max(logit_global_start, chunk_start)
             e = min(logit_global_end, chunk_end)
             if e <= s:
-                logits_chunk = logits[0:0]
+                logits_chunk = sample_logits[0:0]
                 tokens_chunk = tokens[0:0]
             else:
-                logits_chunk = logits[s - chunk_start : e - chunk_start]
+                logits_chunk = sample_logits[s - chunk_start : e - chunk_start]
                 tokens_chunk = tokens[(s + 1) - seq_start : (e + 1) - seq_start]
             assert logits_chunk.size(0) == tokens_chunk.size(0), f"{logits_chunk.size(0)} vs {tokens_chunk.size(0)}"
         else:
@@ -208,7 +212,8 @@ def get_responses(
             logits_chunk = torch.cat([logits_0, logits_1], dim=0)
             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
 
-        seq_start += total_length
+        if qkv_format == "thd":
+            seq_start += total_length
 
         # Apply temperature per-chunk instead of on the full [T, V] logits to avoid
         # a single ~16GiB allocation that OOMs under fragmentation.
@@ -257,6 +262,9 @@ def _allgather_cp_redistribute(
         response_lengths: Response segment lengths per sample.
         max_seq_lens: Optional padded max sequence lengths per sample.
     """
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    if args.qkv_format == "bshd" and cp_size == 1:
+        return
     cp_group = (
         mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
         if dynamic_cp_size is not None
@@ -302,7 +310,8 @@ def _allgather_cp_redistribute(
 
             assert full_resp.size(0) == response_length, f"Expected {response_length}, got {full_resp.size(0)}"
             full_resps.append(full_resp)
-            seq_start += total_length
+            if args.qkv_format == "thd":
+                seq_start += total_length
 
         # Single differentiable all-reduce to gather full response from all CP ranks
         all_cat = torch.cat(full_resps, dim=0)

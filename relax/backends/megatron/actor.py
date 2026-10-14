@@ -427,6 +427,12 @@ class MegatronTrainRayActor(TrainRayActor):
         for i in range(args.num_gpus_per_node):
             if i == dist.get_rank() % args.num_gpus_per_node:
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+                if self.hf_config.model_type in ("deepseek_v41", "deepseek_v41_text"):
+                    # SGLang flattens V4.1 configs and changes their architecture to V4.
+                    from relax.models.deepseekv41.configuration import register_hf_config
+
+                    register_hf_config(for_training=True)
+                    self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
 
