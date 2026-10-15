@@ -15,6 +15,7 @@ import pytest
 
 
 torch = pytest.importorskip("torch")
+checkpoint = pytest.importorskip("torch.utils.checkpoint").checkpoint
 F = torch.nn.functional
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -427,3 +428,62 @@ def test_bshd_contiguous_cp1_redistribution_is_noop() -> None:
         max_seq_lens=[8, 8],
     )
     assert result["values"] is before
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+@pytest.mark.parametrize("with_grad", [False, True])
+def test_bshd_empty_contiguous_cp_checkpoint_keeps_loss_grad_and_detaches_metrics(
+    cp_rank: int, with_grad: bool
+) -> None:
+    _, loss = _runtime(2, cp_rank)
+    args = SimpleNamespace(qkv_format="bshd", allgather_cp=True, rollout_temperature=1.0, entropy_coef=0.0)
+    logits = torch.arange(cp_rank * 8, (cp_rank + 1) * 8).float().view(1, 8, 1).requires_grad_()
+    calls: list[tuple[str, bool, bool]] = []
+    reference = torch.tensor([0.0, 0.0, 1.0, 2.0, 3.0, 4.0])
+
+    def all_reduce(value: torch.Tensor, group: Any) -> torch.Tensor:
+        assert group == "fixture-cp-group"
+        key = ("log_probs", "entropy")[len(calls) % 2]
+        calls.append((key, torch.is_grad_enabled(), value.requires_grad))
+        # Supply the other rank's values while retaining only this rank's graph.
+        return value + (reference - value.detach())
+
+    loss["dist"].nn.all_reduce = all_reduce
+
+    def compute_loss(model_logits: torch.Tensor) -> torch.Tensor:
+        chunk, _ = next(
+            loss["get_responses"](
+                model_logits,
+                args=args,
+                unconcat_tokens=[torch.arange(6)],
+                total_lengths=[6],
+                response_lengths=[6],
+                max_seq_lens=[16],
+            )
+        )
+        # Match calculate_log_probs_and_entropy's detached empty-result branch.
+        log_probs = chunk[:, 0] if len(chunk) else chunk.new_zeros((0,))
+        values = {"log_probs": [log_probs], "entropy": [log_probs.detach()]}
+        loss["_allgather_cp_redistribute"](
+            values,
+            logits=model_logits,
+            args=args,
+            total_lengths=[6],
+            response_lengths=[6],
+            max_seq_lens=[16],
+        )
+        assert values["log_probs"][0].numel() == (4 if cp_rank == 0 else 1)
+        assert not values["entropy"][0].requires_grad
+        return values["log_probs"][0].sum()
+
+    if with_grad:
+        output = checkpoint(compute_loss, logits, use_reentrant=True)
+        output.backward()
+        assert logits.grad is not None
+        assert calls[2:] == [("log_probs", True, True), ("entropy", True, False)]
+    else:
+        with torch.no_grad():
+            output = compute_loss(logits)
+        assert not output.requires_grad
+    torch.testing.assert_close(output, torch.tensor(6.0 if cp_rank == 0 else 4.0))
+    assert calls[:2] == [("log_probs", False, False), ("entropy", False, False)]

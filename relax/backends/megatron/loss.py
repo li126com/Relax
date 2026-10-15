@@ -255,8 +255,8 @@ def _allgather_cp_redistribute(
 
     Args:
         res: Dict mapping metric names to lists of per-sample tensors.
-        logits: Model output used only to determine the local sequence length
-            (``logits.size(1)``).
+        logits: Model output used for the local sequence length and to preserve
+            the backward path on ranks with no local response tokens.
         args: Configuration (needs ``qkv_format``).
         total_lengths: Total sequence lengths (prompt + response) per sample.
         response_lengths: Response segment lengths per sample.
@@ -289,19 +289,24 @@ def _allgather_cp_redistribute(
             e = min(logit_global_end, chunk_end)
 
             if e <= s:
-                # This rank has no response logprobs for this sample. Match the
-                # placeholder's requires_grad to the real data (`value`): forcing
-                # requires_grad=True makes the concatenated all_reduce input require
-                # grad on ranks with an empty chunk while non-empty ranks (F.pad of
-                # a no-grad `value`) do not, so the differentiable dist.nn.all_reduce
-                # below builds a backward graph on some CP ranks but not others and
-                # the collective deadlocks.
+                # Empty logprobs can be detached constants. Preserve the logits
+                # path inside loss recomputation so every CP rank participates
+                # in all_reduce backward, but keep no-grad forwards and metric-
+                # only entropy free of an autograd graph.
                 full_resp = torch.zeros(
                     (response_length, *value.shape[1:]),
                     dtype=value.dtype,
                     device=value.device,
-                    requires_grad=value.requires_grad,
                 )
+                if (
+                    torch.is_grad_enabled()
+                    and logits.requires_grad
+                    and (
+                        key in {"log_probs", "values", "topk_log_probs"}
+                        or (key == "entropy" and getattr(args, "entropy_coef", 0.0) != 0)
+                    )
+                ):
+                    full_resp = full_resp + logits[..., :0].sum().to(dtype=value.dtype)
             else:
                 resp_start = s - logit_global_start
                 resp_end = e - logit_global_start
