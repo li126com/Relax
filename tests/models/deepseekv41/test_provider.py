@@ -35,6 +35,7 @@ def execution_provider(tmp_path: Path) -> DeepSeekV41ModelProvider:
         csa_compress_ratios=[0, 0],
         bf16=True,
         params_dtype=torch.bfloat16,
+        moe_router_dtype="fp32",
         hidden_dropout=0.0,
         attention_dropout=0.0,
         recompute_granularity=None,
@@ -93,6 +94,8 @@ def test_provider_real_fields_reach_native_gpt_constructor(execution_provider, m
     assert calls == [instance]
     assert instance.config is not execution_provider
     assert instance.config._vp_stage == 0
+    assert instance.config.moe_router_dtype == "fp32"
+    assert instance.config.params_dtype is torch.bfloat16
     assert instance.kwargs["pg_collection"] is execution_provider._pg_collection
     assert instance.kwargs["pre_process"] is pre and instance.kwargs["post_process"] is post
     assert instance.kwargs["vp_stage"] == 0

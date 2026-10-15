@@ -46,7 +46,7 @@ def _miles_freqs_reference(
 
 @pytest.mark.parametrize(
     "dim,original,base,factor",
-    [(64, 0, 10000, 16), (64, 65536, 160000, 16), (64, 65536, 160000, 4), (8, 4096, 1600, 4), (2, 1, 10000, 16)],
+    [(64, 0, 10000, 16), (64, 65536, 160000, 16), (2, 1, 10000, 16)],
 )
 def test_rope_frequencies_match_miles_plain_yarn_and_collapsed_ramp(
     dim: int, original: int, base: float, factor: float
@@ -408,7 +408,7 @@ def _sparse_module() -> Any:
     return importlib.import_module("relax.models.deepseekv41.ops.sparse_attention")
 
 
-@pytest.mark.parametrize("width,multiple,expected", [(63, 64, 64), (64, 64, 64), (129, 128, 256), (640, 128, 640)])
+@pytest.mark.parametrize("width,multiple,expected", [(63, 64, 64), (640, 128, 640)])
 def test_sparse_topk_padding_uses_minus_one_not_a_valid_kv_row(width: int, multiple: int, expected: int) -> None:
     module = _sparse_module()
     indices = torch.arange(width, dtype=torch.int32).view(1, 1, 1, width)

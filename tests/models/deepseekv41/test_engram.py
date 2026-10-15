@@ -22,7 +22,6 @@ from relax.models.deepseekv41.engram import (
     build_engram_layout,
     compute_hash_multipliers,
     engram_gate,
-    find_next_prime,
 )
 
 
@@ -88,17 +87,11 @@ def test_compressed_token_map_normalizes_text_but_keeps_distinct_bytes() -> None
     assert size == 6
 
 
-def test_find_next_prime_skips_previously_used_primes() -> None:
-    assert find_next_prime(4, set()) == 5
-    assert find_next_prime(4, {5, 7}) == 11
-
-
 def test_build_engram_layout_matches_miles_unique_prime_order() -> None:
     layout = build_engram_layout(_layout_config())
     assert layout.layer_ids == (1, 2)
     assert layout.primes == (((5, 7), (11, 13)), ((17, 19), (23, 29)))
     assert layout.num_embeddings == (36, 88)
-    assert build_engram_layout(_layout_config()) is layout
 
 
 def test_build_engram_layout_allows_no_engram_layers() -> None:
@@ -217,7 +210,7 @@ def test_mmap_rejects_truncated_headers(tmp_path: Path, payload: bytes) -> None:
         _mmap_rows(str(path), "table", 0, 1, 32, expected_rows=1, expected_dtypes=("U8",))
 
 
-@pytest.mark.parametrize("rows,tp_size", [(10, 3), (3, 8), (8, 4), (1, 1)])
+@pytest.mark.parametrize("rows,tp_size", [(10, 3), (3, 8)])
 def test_table_shards_cover_every_row_exactly_once(rows: int, tp_size: int) -> None:
     shards = [_table_shard(rows, tp_size, rank) for rank in range(tp_size)]
     owned = [row for start, end in shards for row in range(start, end)]

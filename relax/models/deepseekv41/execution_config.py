@@ -16,13 +16,10 @@ def _validate_runtime_layout(provider: Any) -> None:
     cp = getattr(provider, "context_parallel_size", 1)
     if cp < 1:
         raise ValueError("DeepSeek V4.1 context_parallel_size must be positive.")
-    if cp > 1 and (
-        getattr(provider, "cp_partition_mode", "zigzag") != "contiguous"
-        or not getattr(provider, "v41_allgather_cp", False)
-    ):
-        raise ValueError(
-            "DeepSeek V4.1 CP>1 requires --cp-partition-mode contiguous and --allgather-cp; zigzag CP is unsupported."
-        )
+    # BSHD is sliced contiguously by Relax's allgather-CP ingestion, not by
+    # Core's native cp_partition_mode (whose contiguous path requires THD).
+    if cp > 1 and not getattr(provider, "v41_allgather_cp", False):
+        raise ValueError("DeepSeek V4.1 CP>1 requires --allgather-cp for contiguous BSHD input.")
 
     pp = getattr(provider, "pipeline_model_parallel_size", 1)
     if pp < 1:
@@ -75,11 +72,6 @@ def configure_execution_runtime(provider: Any, args: Namespace) -> None:
     # this attention implementation caches fixed CP groups and cannot follow it.
     if getattr(args, "dynamic_context_parallel", False):
         raise ValueError("DeepSeek V4.1 currently supports fixed context-parallel groups only.")
-    if getattr(args, "use_rollout_routing_replay", False):
-        raise NotImplementedError(
-            "DeepSeek V4.1 currently requires BSHD, but Relax's rollout routing replay is not aligned "
-            "with BSHD padded microbatches yet; disable --use-rollout-routing-replay."
-        )
     if hasattr(args, "overlap_moe_expert_parallel_comm"):
         provider.overlap_moe_expert_parallel_comm = args.overlap_moe_expert_parallel_comm
     provider.variable_seq_lengths = True

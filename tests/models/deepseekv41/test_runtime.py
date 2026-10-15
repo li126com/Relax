@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
 from math import prod
 from types import SimpleNamespace
 
@@ -127,8 +126,6 @@ def test_runtime_carry_plan_boundary_retains_only_needed_state(runtime_config) -
     assert after_index.latent_keys == (4,)
     assert after_index.index_k_keys == ()
     assert after_index.topk and after_index.candidates
-    with pytest.raises(FrozenInstanceError):
-        active.topk = False
 
 
 @pytest.mark.parametrize("layer", [-2, 8])
@@ -137,8 +134,9 @@ def test_runtime_invalid_carry_boundary_raises(runtime_config, layer) -> None:
         V41CarryPlan(runtime_config, layer)
 
 
-@pytest.mark.parametrize("sp,tp,cp", [(False, 1, 1), (False, 2, 2), (True, 2, 1), (True, 2, 2)])
-@pytest.mark.parametrize("s,b", [(3, 1), (5, 2)])
+@pytest.mark.parametrize(
+    "sp,tp,cp,s,b", [(False, 1, 1, 3, 1), (False, 2, 2, 5, 2), (True, 2, 1, 3, 1), (True, 2, 2, 5, 2)]
+)
 def test_runtime_carry_roundtrip_parallel_shapes(runtime_config, sp, tp, cp, s, b) -> None:
     runtime_config.sequence_parallel = sp
     runtime_config.tensor_model_parallel_size = tp

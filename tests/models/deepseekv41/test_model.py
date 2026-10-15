@@ -247,21 +247,6 @@ def test_model_block_rejects_empty_or_mixed_instance_specs(model_config) -> None
         V41TransformerBlock(model_config, spec)
 
 
-def test_model_layer_carry_uses_previous_plan_and_packs_current_plan(model_config, monkeypatch) -> None:
-    monkeypatch.setattr(HyperConnectionTransformerLayer, "__init__", _fake_layer_init)
-    monkeypatch.setattr(HyperConnectionTransformerLayer, "forward", _fake_layer_forward)
-    model_config.recompute_granularity = "full"
-    runtime = V41Runtime()
-    layer = V41TransformerLayer(model_config, None, runtime, layer_number=1)
-    hidden = torch.randn(3, 1, 8, dtype=torch.bfloat16)
-    initial = v41_pack_carry(hidden, runtime, V41IdsOnlyPlan(model_config))
-    output, context = layer.forward(initial, context="context")
-    restored = V41Runtime()
-    unpacked = v41_unpack_carry(output, restored, V41CarryPlan(model_config, 0))
-    assert torch.equal(unpacked, hidden * 2)
-    assert context == "context" and restored.pre.shape == (3, 1, 4)
-
-
 def test_model_last_layer_contracts_using_final_pre(model_config, monkeypatch) -> None:
     monkeypatch.setattr(HyperConnectionTransformerLayer, "__init__", _fake_layer_init)
     monkeypatch.setattr(HyperConnectionTransformerLayer, "forward", _fake_layer_forward)
@@ -292,11 +277,12 @@ def test_model_engram_receives_restored_ids_before_layer(model_config, monkeypat
     runtime = V41Runtime(input_ids=ids)
     layer = V41TransformerLayer(model_config, None, runtime, layer_number=1)
     hidden = torch.randn(3, 1, 8, dtype=torch.bfloat16)
-    output, _ = layer.forward(v41_pack_carry(hidden, runtime, V41IdsOnlyPlan(model_config)))
+    output, context = layer.forward(v41_pack_carry(hidden, runtime, V41IdsOnlyPlan(model_config)), context="context")
     restored = V41Runtime()
     result = v41_unpack_carry(output, restored, V41CarryPlan(model_config, 0))
     assert torch.equal(layer.v41_engram.seen, ids)
     assert torch.equal(result, (hidden + 1) * 2)
+    assert context == "context" and restored.pre.shape == (3, 1, 4)
     assert restored.input_ids is None
 
 

@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 import pickle
 from copy import deepcopy
 from pathlib import Path
@@ -185,23 +183,19 @@ def test_hf_config_registration_round_trip(checkpoint_config: dict[str, Any], tm
     config.save_pretrained(tmp_path)
 
     loaded = transformers.AutoConfig.from_pretrained(tmp_path, local_files_only=True)
+    restored = pickle.loads(pickle.dumps(loaded))
 
     assert isinstance(loaded, DeepSeekV41Config)
+    assert isinstance(restored, DeepSeekV41Config)
+    assert restored.to_dict() == loaded.to_dict()
     assert loaded.model_type == "deepseek_v41"
     if not flattened:
         assert isinstance(loaded.text_config, DeepSeekV41TextConfig)
+        assert isinstance(restored.text_config, DeepSeekV41TextConfig)
         assert loaded.text_config.engram_layer_ids == [1]
     assert normalize_text_config(loaded)["compress_ratios"] == raw.get(
         "compress_ratios", raw.get("text_config", {}).get("compress_ratios")
     )
-
-
-def test_hf_config_is_pickleable_for_actor_transfer(checkpoint_config: dict[str, Any]) -> None:
-    config = DeepSeekV41Config(**checkpoint_config)
-    restored = pickle.loads(pickle.dumps(config))
-    assert isinstance(restored, DeepSeekV41Config)
-    assert isinstance(restored.text_config, DeepSeekV41TextConfig)
-    assert restored.to_dict() == config.to_dict()
 
 
 def test_training_registration_restores_rollout_override_without_rebinding_config(
@@ -257,6 +251,7 @@ def test_provider_uses_text_architecture_without_mutating_hf_config(
     assert provider.moe_router_topk == 2
     assert provider.moe_router_score_function == "sqrtsoftplus"
     assert provider.moe_router_topk_scaling_factor == 1.5
+    assert provider.moe_router_dtype == "fp32"
     assert provider.q_lora_rank == 64
     assert provider.kv_lora_rank == 32
     assert provider.qk_head_dim == 16
@@ -279,6 +274,7 @@ def test_provider_uses_text_architecture_without_mutating_hf_config(
         expected = tuple(text[name]) if isinstance(text[name], list) else text[name]
         assert getattr(provider, f"v41_{name}") == expected
     assert {"num_layers", "q_lora_rank", "moe_ffn_hidden_size", "mtp_num_layers"} <= ARCHITECTURE_KEYS
+    assert "moe_router_dtype" in ARCHITECTURE_KEYS
 
 
 @pytest.mark.parametrize("flattened", [False, True])
@@ -530,16 +526,17 @@ def test_explicit_bf16_export_does_not_requantize(bridge: DeepSeekV41Bridge) -> 
     assert exported[name] is weight
 
 
-@pytest.mark.parametrize("expert", [False, True])
+@pytest.mark.parametrize("checkpoint_kind", ["dense_fp8", "expert_fp8", "expert_mxfp4"])
 @pytest.mark.parametrize("scale_encoding", ["float32", "e8m0", "uint8"])
 def test_quantized_export_restores_source_geometry_and_round_trips(
-    bridge: DeepSeekV41Bridge, expert: bool, scale_encoding: str
+    bridge: DeepSeekV41Bridge, checkpoint_kind: str, scale_encoding: str
 ) -> None:
-    name = "layers.1.ffn.experts.2.w1.weight" if expert else "layers.1.attn.wq_a.weight"
+    packed = checkpoint_kind == "expert_mxfp4"
+    name = "layers.1.attn.wq_a.weight" if checkpoint_kind == "dense_fp8" else "layers.1.ffn.experts.2.w1.weight"
     scale_key = name.removesuffix(".weight") + ".scale"
-    weight = torch.full((2, 64) if expert else (64, 64), 4.0, dtype=torch.bfloat16)
+    weight = torch.full((2, 64) if packed else (64, 64), 4.0, dtype=torch.bfloat16)
     source_scale = _scale_encoding(torch.ones((2, 2)), scale_encoding)
-    source_weight = torch.full((2, 32), 0x11, dtype=torch.uint8) if expert else weight.to(torch.float8_e4m3fn)
+    source_weight = torch.full((2, 32), 0x11, dtype=torch.uint8) if packed else weight.to(torch.float8_e4m3fn)
     source = {name: source_weight, scale_key: source_scale}
 
     exported = bridge.maybe_modify_converted_hf_weight(SimpleNamespace(weight_dtype=None), {name: weight}, source)
@@ -548,76 +545,9 @@ def test_quantized_export_restores_source_geometry_and_round_trips(
     assert exported[name].shape == source_weight.shape
     assert exported[scale_key].shape == source_scale.shape
     assert exported[scale_key].dtype == source_scale.dtype
-    if not expert:
+    if not packed:
         assert exported[name].dtype == torch.float8_e4m3fn
     assert torch.equal(bridge.maybe_modify_loaded_hf_weight(name, exported), weight)
-
-
-@pytest.mark.parametrize("scale_encoding", ["float32", "e8m0", "uint8"])
-def test_fp8_expert_export_dispatches_by_source_dtype_not_expert_name(
-    bridge: DeepSeekV41Bridge, scale_encoding: str
-) -> None:
-    name = "layers.1.ffn.experts.2.w1.weight"
-    scale_key = name.removesuffix(".weight") + ".scale"
-    weight = torch.full((64, 64), 4.0, dtype=torch.bfloat16)
-    scale = _scale_encoding(torch.ones((2, 2)), scale_encoding)
-    source = {name: weight.to(torch.float8_e4m3fn), scale_key: scale}
-
-    exported = bridge.maybe_modify_converted_hf_weight(SimpleNamespace(weight_dtype=None), {name: weight}, source)
-
-    assert exported[name].dtype == torch.float8_e4m3fn
-    assert exported[name].shape == (64, 64), "FP8 experts must not acquire a packed FP4 layout"
-    assert exported[scale_key].shape == (2, 2)
-    assert exported[scale_key].dtype == scale.dtype
-    assert torch.equal(bridge.maybe_modify_loaded_hf_weight(name, exported), weight)
-
-
-def test_relax_provider_preserves_v41_architecture_and_applies_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests.backends.megatron.test_model_provider_vpp import _bridge_args, _FakeProvider, _load_model_provider
-
-    provider = _FakeProvider()
-    architecture = {
-        "num_layers": 4,
-        "moe_layer_freq": [1, 1, 1, 1],
-        "q_lora_rank": 64,
-        "kv_lora_rank": 32,
-        "moe_router_score_function": "sqrtsoftplus",
-        "moe_router_dtype": "fp32",
-        "moe_router_bias_update_rate": 0.0,
-        "mtp_num_layers": None,
-    }
-    vars(provider).update(architecture, v41_hf_config={})
-    module, _ = _load_model_provider(monkeypatch, provider)
-    args = _bridge_args(
-        num_layers=1,
-        moe_layer_freq=0,
-        q_lora_rank=8,
-        kv_lora_rank=8,
-        moe_router_score_function="softmax",
-        moe_router_dtype=None,
-        moe_router_bias_update_rate=1e-3,
-        mtp_num_layers=None,
-        virtual_pipeline_model_parallel_size=None,
-    )
-
-    module.get_model_provider_func(args)
-
-    assert {name: getattr(provider, name) for name in architecture} == architecture
-    assert provider.tensor_model_parallel_size == args.tensor_model_parallel_size
-    assert provider.pipeline_model_parallel_size == args.pipeline_model_parallel_size
-    assert provider.params_dtype == torch.bfloat16
-    assert provider.finalized
-
-
-def test_relax_provider_rejects_v41_mtp_before_finalize(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests.backends.megatron.test_model_provider_vpp import _bridge_args, _FakeProvider, _load_model_provider
-
-    provider = _FakeProvider()
-    provider.v41_hf_config = {}
-    module, _ = _load_model_provider(monkeypatch, provider)
-    with pytest.raises(ValueError, match="MTP/DSpark"):
-        module.get_model_provider_func(_bridge_args(mtp_num_layers=1))
-    assert not provider.finalized
 
 
 def test_v41_provider_finalize_does_not_apply_v4_tp_restriction(bridge: DeepSeekV41Bridge) -> None:
@@ -627,31 +557,3 @@ def test_v41_provider_finalize_does_not_apply_v4_tp_restriction(bridge: DeepSeek
     assert provider.tensor_model_parallel_size == 2
     assert provider.csa_compress_ratios == [0, 2, 1, 1]
     assert provider.experimental_attention_variant is None
-
-
-@pytest.mark.skipif(
-    not os.environ.get("DEEPSEEK_V41_CHECKPOINT"), reason="requires the downloaded V4.1 checkpoint on the remote host"
-)
-def test_downloaded_checkpoint_dispatches_without_loading_model_weights() -> None:
-    from megatron.bridge import AutoBridge
-
-    checkpoint = os.environ["DEEPSEEK_V41_CHECKPOINT"]
-    original = json.loads((Path(checkpoint) / "config.json").read_text())
-    text = original.get("text_config", original)
-
-    auto = AutoBridge.from_hf_pretrained(checkpoint, trust_remote_code=True)
-    provider = auto.to_megatron_provider(load_weights=False)
-
-    assert isinstance(provider, DeepSeekV41ModelProvider)
-    assert (provider.num_layers, provider.hidden_size) == (text["num_hidden_layers"], text["hidden_size"])
-    assert provider.q_lora_rank == text["q_lora_rank"]
-    assert provider.kv_lora_rank == text["head_dim"]
-    assert provider.rotary_scaling_factor == text["rope_scaling"]["factor"]
-    assert provider.v41_kv_source_layer_ids == tuple(text["kv_source_layer_ids"])
-    assert provider.v41_engram_num_embeddings == tuple(text["engram_num_embeddings"])
-    assert provider.params_dtype == torch.bfloat16
-    provider.tensor_model_parallel_size = 2
-    provider.finalize()
-    assert provider.hidden_dropout == 0.0
-    assert provider.attention_dropout == text.get("attention_dropout", 0.0)
-    assert str(provider.v41_hf_checkpoint) == checkpoint

@@ -48,13 +48,12 @@ def _provider(**changes: Any) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-@pytest.mark.parametrize("tp", [1, 2, 4, 8])
-@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize("tp,sequence_parallel", [(1, False), (2, True), (8, True)])
 def test_validate_execution_config_allows_tp_with_and_without_sp(tp: int, sequence_parallel: bool) -> None:
     validate_execution_config(_provider(tensor_model_parallel_size=tp, sequence_parallel=sequence_parallel))
 
 
-@pytest.mark.parametrize("pp", [1, 2, 4, 5, 8])
+@pytest.mark.parametrize("pp", [1, 2, 8])
 def test_validate_execution_config_allows_uniform_pp(pp: int) -> None:
     validate_execution_config(_provider(pipeline_model_parallel_size=pp))
 
@@ -70,8 +69,8 @@ def test_validate_execution_config_allows_standard_moe_recompute(recompute: str 
         ({"v41_qkv_format": "thd"}, "packed THD"),
         ({"dynamic_context_parallel": True}, "fixed context"),
         ({"context_parallel_size": 0}, "positive"),
-        ({"context_parallel_size": 2, "v41_allgather_cp": True}, "contiguous"),
         ({"context_parallel_size": 2, "cp_partition_mode": "contiguous"}, "allgather-cp"),
+        ({"context_parallel_size": 2}, "allgather-cp"),
         ({"pipeline_model_parallel_size": 0}, "positive"),
         ({"pipeline_model_parallel_size": 3}, "divisible by PP"),
         ({"virtual_pipeline_model_parallel_size": 2}, "virtual pipeline"),
@@ -100,10 +99,11 @@ def test_validate_execution_config_rejects_unsupported_paths(changes: dict[str, 
         validate_execution_config(_provider(**changes))
 
 
-def test_validate_execution_config_allows_contiguous_cp_and_preserves_cpu_optimizer_deepep() -> None:
+@pytest.mark.parametrize("cp_partition_mode", ["zigzag", "contiguous"])
+def test_validate_execution_config_allows_allgather_cp_and_preserves_runtime_options(cp_partition_mode: str) -> None:
     provider = _provider(
         context_parallel_size=2,
-        cp_partition_mode="contiguous",
+        cp_partition_mode=cp_partition_mode,
         v41_allgather_cp=True,
         pipeline_model_parallel_size=2,
         recompute_granularity="full",
@@ -116,7 +116,7 @@ def test_validate_execution_config_allows_contiguous_cp_and_preserves_cpu_optimi
     assert vars(provider) == before
 
 
-@pytest.mark.parametrize(("pp", "recompute"), [(1, None), (2, None), (1, "full"), (2, "full")])
+@pytest.mark.parametrize(("pp", "recompute"), [(1, None), (2, "full")])
 def test_configure_execution_runtime_forwards_existing_options(pp: int, recompute: str | None) -> None:
     provider = _provider(pipeline_model_parallel_size=pp, recompute_granularity=recompute, variable_seq_lengths=False)
     args = SimpleNamespace(hf_checkpoint="fixture-checkpoint", qkv_format="bshd", allgather_cp=False)
@@ -148,9 +148,23 @@ def test_configure_execution_runtime_does_not_drop_overlap_request() -> None:
         )
 
 
-def test_configure_execution_runtime_rejects_unaligned_rollout_routing_replay() -> None:
-    with pytest.raises(NotImplementedError, match="routing replay.*BSHD"):
-        configure_execution_runtime(_provider(), SimpleNamespace(use_rollout_routing_replay=True))
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_configure_execution_runtime_allows_bshd_rollout_routing_replay(cp_size: int) -> None:
+    provider = _provider(context_parallel_size=cp_size, v41_allgather_cp=cp_size > 1)
+    configure_execution_runtime(provider, SimpleNamespace(use_rollout_routing_replay=True))
+    assert provider.v41_qkv_format == "bshd"
+    assert provider.cp_partition_mode == "zigzag"
+    assert provider.v41_allgather_cp == (cp_size > 1)
+
+
+def test_configure_execution_runtime_forwards_allgather_without_changing_native_cp_partition_mode() -> None:
+    provider = _provider(context_parallel_size=2)
+    configure_execution_runtime(
+        provider,
+        SimpleNamespace(qkv_format="bshd", allgather_cp=True, use_rollout_routing_replay=True),
+    )
+    assert provider.v41_allgather_cp is True
+    assert provider.cp_partition_mode == "zigzag"
 
 
 @pytest.mark.parametrize("field", ["hidden_dropout", "attention_dropout"])

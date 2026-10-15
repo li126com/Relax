@@ -17,7 +17,7 @@ def test_sglang_requirements_align_with_sglang_dependency_requirements():
 def test_sglang_dockerfile_targets_official_cuda13_hopper():
     dockerfile = (ROOT / "docker/Dockerfile").read_text()
     assert "lmsysorg/sglang:v0.5.21-cu130" in dockerfile
-    assert "transformer_engine[core_cu13,pytorch]==2.14.1" in dockerfile
+    assert "transformer_engine[core_cu13,pytorch]==2.18.0" in dockerfile
     assert "FLASH_ATTENTION_FORCE_BUILD=TRUE" in dockerfile
     assert "cd hopper/" in dockerfile
     assert "0f82fead0b2d59f6390c62a1d74e927159bc5a7b" in dockerfile
