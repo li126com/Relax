@@ -10,6 +10,7 @@ variables at startup instead of letting them silently do nothing.
 """
 
 import os
+import sys
 from typing import Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Tuple, TypeVar
 
 
@@ -102,6 +103,41 @@ def is_env_set(env: str) -> bool:
     """
     raw = os.environ.get(env)
     return raw is not None and raw.strip() != ""
+
+
+def configure_fp8_block_scaling() -> None:
+    """Resolve the training worker's scale policy before TE imports its recipe.
+
+    A CPU driver may see different GPUs from its workers. Only an assigned
+    accelerator worker selects a default; explicit runtime settings take priority.
+    """
+    import ray
+
+    if not ray.is_initialized():
+        return
+    accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
+    if not any(accelerator_ids.values()):
+        return
+
+    name = "NVTE_FP8_BLOCK_SCALING_FP32_SCALES"
+    value = Envs.NVTE_FP8_BLOCK_SCALING_FP32_SCALES
+    if not is_env_set(name) and accelerator_ids.get("GPU"):
+        from relax.utils import device as device_utils
+
+        if device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA:
+            value = "0" if device_utils.device_module.get_device_capability()[0] >= 10 else "1"
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+
+    # TE fixes these defaults at import time. Do not silently change an already
+    # imported recipe while the online weight sender uses a different scale grid.
+    recipe = getattr(sys.modules.get("transformer_engine.common.recipe"), "Float8BlockScaling", None)
+    if recipe is not None and any(
+        getattr(recipe, field).power_2_scale != (value == "0")
+        for field in ("fp8_quant_fwd_inp", "fp8_quant_fwd_weight", "fp8_quant_bwd_grad")
+    ):
+        raise RuntimeError(f"Set {name}={value} before importing Transformer Engine; restart the training worker.")
+    os.environ[name] = value
 
 
 class EnvProperty:
