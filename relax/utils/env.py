@@ -108,24 +108,31 @@ def is_env_set(env: str) -> bool:
 def configure_fp8_block_scaling() -> None:
     """Resolve the training worker's scale policy before TE imports its recipe.
 
-    A CPU driver may see different GPUs from its workers. Only an assigned
-    accelerator worker selects a default; explicit runtime settings take priority.
+    A CPU driver may see different GPUs from its workers. Ray assignments and
+    torchrun's LOCAL_RANK identify the worker's GPU; explicit settings take priority.
     """
     import ray
 
-    if not ray.is_initialized():
-        return
-    accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
-    if not any(accelerator_ids.values()):
+    accelerator_ids = ray.get_runtime_context().get_accelerator_ids() if ray.is_initialized() else None
+    if accelerator_ids is not None:
+        if not any(accelerator_ids.values()):
+            return
+    elif not is_env_set("LOCAL_RANK"):
         return
 
     name = "NVTE_FP8_BLOCK_SCALING_FP32_SCALES"
     value = Envs.NVTE_FP8_BLOCK_SCALING_FP32_SCALES
-    if not is_env_set(name) and accelerator_ids.get("GPU"):
+    if not is_env_set(name) and (accelerator_ids is None or accelerator_ids.get("GPU")):
         from relax.utils import device as device_utils
 
         if device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA:
-            value = "0" if device_utils.device_module.get_device_capability()[0] >= 10 else "1"
+            if accelerator_ids is None:
+                device_index = Envs.LOCAL_RANK
+            else:
+                gpu_id = str(accelerator_ids["GPU"][0])
+                visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+                device_index = int(gpu_id) if visible_devices is None else visible_devices.split(",").index(gpu_id)
+            value = "0" if device_utils.device_module.get_device_capability(device_index)[0] >= 10 else "1"
     if value not in ("0", "1"):
         raise ValueError(f"{name} must be 0 or 1, got {value!r}")
 
