@@ -42,7 +42,7 @@ CKPT_ARGS=(
     --megatron-to-hf-mode bridge
     --load "${SAVE_DIR}/${EXP_NAME}/checkpoints"
     --save "${SAVE_DIR}/${EXP_NAME}/checkpoints"
-    --save-interval 10
+    --save-interval 100
     --max-actor-ckpt-to-keep 2
 )
 
