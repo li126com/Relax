@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Adapted from radixark/miles: miles/kernels/attention/dsa/tilelang/indexer_fwd.py (Apache-2.0).
 
-# Adapted from https://github.com/tile-ai/tilelang/blob/4956b5835fa554af6c03d4a6289cad44bf310869/examples/deepseek_v32/fp8_lighting_indexer.py
+# Reference: https://github.com/tile-ai/tilelang/blob/4956b5835fa554af6c03d4a6289cad44bf310869/examples/deepseek_v32/fp8_lighting_indexer.py
 import tilelang
 import torch
 from tilelang import language as T

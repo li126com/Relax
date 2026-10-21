@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Megatron Bridge conversion contract for Miles' DeepSeek V4.1 text model."""
+"""Megatron Bridge conversion contract for the DeepSeek V4.1 text model."""
 
 from collections.abc import Mapping
 from types import SimpleNamespace

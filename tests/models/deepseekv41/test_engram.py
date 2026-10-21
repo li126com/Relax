@@ -87,7 +87,7 @@ def test_compressed_token_map_normalizes_text_but_keeps_distinct_bytes() -> None
     assert size == 6
 
 
-def test_build_engram_layout_matches_miles_unique_prime_order() -> None:
+def test_build_engram_layout_matches_unique_prime_order() -> None:
     layout = build_engram_layout(_layout_config())
     assert layout.layer_ids == (1, 2)
     assert layout.primes == (((5, 7), (11, 13)), ((17, 19), (23, 29)))

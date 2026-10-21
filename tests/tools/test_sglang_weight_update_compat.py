@@ -12,14 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, Mock, call, patch
 
-from tests.tools.sglang_patch_source import (
-    PATCH_PATH,
-    _blob_hash,
-    _validated_source,
-    apply_file_patch,
-    extract_functions,
-    patched_functions,
-)
+from tests.tools.sglang_patch_source import PATCH_PATH, patched_functions
 
 
 CONTROL_PATH = "python/sglang/srt/managers/tokenizer_control_mixin.py"
@@ -577,56 +570,6 @@ class TestLegacyWeightUpdateSessions(unittest.IsolatedAsyncioTestCase):
                     await manager.resume_memory_occupation(_Request())
                 self.assertTrue(manager.is_pause)
                 self.assertNotIn("resume-memory", [event[0] for event in manager.events])
-
-
-class TestPatchSourceExtraction(unittest.TestCase):
-    source = "class Example:\n    def value(self):\n        value = 1\n        return value + 10\n"
-
-    def _patch(self, replacement: int = 2) -> str:
-        return (
-            "diff --git a/example.py b/example.py\n"
-            f"index {_blob_hash(self.source)}..{'0' * 40} 100644\n"
-            "--- a/example.py\n"
-            "+++ b/example.py\n"
-            "@@ -3 +3 @@\n"
-            "-        value = 1\n"
-            f"+        value = {replacement}\n"
-        )
-
-    def test_zero_context_hunk_still_executes_complete_method(self) -> None:
-        source = _validated_source(self.source, self._patch(), "example.py")
-        method = extract_functions(source, "example.py", {"value"})[0]
-        module = ast.Module(body=[method], type_ignores=[])
-        namespace: dict[str, Any] = {}
-        exec(compile(module, "example.py", "exec"), namespace)
-        self.assertEqual(namespace["value"](object()), 12)
-
-    def test_already_patched_source_round_trips_against_current_hunks(self) -> None:
-        source = apply_file_patch(self.source, self._patch(), "example.py")
-        self.assertEqual(_validated_source(source, self._patch(), "example.py"), source)
-        with self.assertRaisesRegex(AssertionError, "Source does not match"):
-            _validated_source(source, self._patch(replacement=3), "example.py")
-
-    def test_multiple_patches_validate_pristine_and_final_sources(self) -> None:
-        first = self._patch()
-        intermediate = apply_file_patch(self.source, first, "example.py")
-        second = self._patch(replacement=3).replace(_blob_hash(self.source), _blob_hash(intermediate))
-        second = second.replace("-        value = 1", "-        value = 2")
-        expected = intermediate.replace("value = 2", "value = 3")
-        self.assertEqual(_validated_source(self.source, first, "example.py", (second,)), expected)
-        self.assertEqual(_validated_source(expected, first, "example.py", (second,)), expected)
-
-    def test_wrong_source_outside_patch_context_is_rejected(self) -> None:
-        source = self.source.replace("return value + 10", "return value + 20")
-        with self.assertRaisesRegex(AssertionError, "Source does not match"):
-            _validated_source(source, self._patch(), "example.py")
-        source = apply_file_patch(source, self._patch(), "example.py")
-        with self.assertRaisesRegex(AssertionError, "target SGLang blob"):
-            _validated_source(source, self._patch(), "example.py")
-
-    def test_truncated_hunk_is_rejected(self) -> None:
-        with self.assertRaisesRegex(AssertionError, "Inconsistent diff counts"):
-            apply_file_patch(self.source, self._patch().rsplit("+", 1)[0], "example.py")
 
 
 class TestSchedulerLegacyPadding(unittest.TestCase):

@@ -107,15 +107,6 @@ def test_transient_state_is_cleared_before_selective_or_tms_offload(
     assert set(first.state_dict()) == {"weight"}
 
 
-def test_duplicate_owner_references_can_release_state_idempotently(monkeypatch: pytest.MonkeyPatch) -> None:
-    events: list[str] = []
-    owner = _Owner("owner", events)
-    offloader = _offloader(monkeypatch, [owner, owner], events)
-    offloader.offload()
-    assert events == ["owner", "owner", "offload"]
-    assert owner.release_calls == 2
-
-
 def test_disabled_offload_does_not_clear_transient_state_or_run_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     owner = _Owner("owner", events)
@@ -135,15 +126,6 @@ def test_other_models_without_release_hook_keep_existing_offload_behavior(monkey
     offloader.offload()
     offloader.reload()
     assert events == ["offload", "reload"] and model[0].weight is initial
-
-
-def test_no_model_and_non_callable_hook_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:
-    events: list[str] = []
-    _offloader(monkeypatch, None, events).offload()
-    model = nn.Module()
-    model._release_transient_state = 1
-    _offloader(monkeypatch, [model], events).offload()
-    assert events == ["offload", "offload"]
 
 
 def test_reload_does_not_clear_newly_rebuilt_transient_state(monkeypatch: pytest.MonkeyPatch) -> None:

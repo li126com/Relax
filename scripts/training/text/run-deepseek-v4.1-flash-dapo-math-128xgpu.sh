@@ -2,11 +2,9 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Full-model text RL counterpart of Miles' 80-step DAPO-Math-17K report.
-# https://radixark.mintlify.app/models/deepseek/deepseek-v4-1-flash
-# Keep TP4/PP1/CP1 and decode CUDA graphs disabled.
-# H800 capacity changes: EP128, four 32-GPU DP-attention rollout engines,
-# CPU Adam instead of Miles' NVMe-streamed optimizer, and full recompute:
+# Full-model text RL on DAPO-Math-17K for 80 updates.
+# Use TP2/PP2/CP2/EP64 with decode CUDA graphs disabled.
+# Four 32-GPU DP-attention rollout engines, CPU Adam and full recompute:
 # selective moe/mlp ran out of memory during the 15th colocated update.
 # Per-node host RAM must cover CPU optimizer state, offload backups and Engram.
 # This is NOT a validated 128-H800 memory/performance guarantee.
@@ -26,26 +24,23 @@ RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)"
 : "${MODEL_DIR:?Set MODEL_DIR to the model root}"
 : "${DATA_DIR:?Set DATA_DIR to the dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
-NUM_GPUS_PER_NODE="${NUM_GPUS_PER_NODE:-8}"
 HF_CKPT="${HF_CKPT:-${MODEL_DIR}/DeepSeek-V4.1-bf16}"
 PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl}"
-PROJECT_NAME="${PROJECT_NAME:-Relax/rl/deepseek-v41-dapo-math}"
+PROJECT_NAME="${PROJECT_NAME:-Relax/dev/deepseek-v41-dapo-math}"
 EXP_NAME="${EXP_NAME:-deepseek-v41-flash-dapo-math-gpu128-bshd}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-80}"
-USE_CLEARML="${USE_CLEARML:-1}"
-LOG_DIR="${LOG_DIR:-${RELAX_ROOT}/deepseek_v41_log}"
+LOG_DIR="${LOG_DIR:-log}"
 source "${RELAX_ROOT}/scripts/models/deepseek-v4.1-flash.sh"
 
 CKPT_ARGS=(
     --hf-checkpoint "${HF_CKPT}"
     --ref-load "${HF_CKPT}"
     --megatron-to-hf-mode bridge
-    --load "${SAVE_DIR}/${EXP_NAME}/checkpoints"
+    # --load "${SAVE_DIR}/${EXP_NAME}/checkpoints"
     --save "${SAVE_DIR}/${EXP_NAME}/checkpoints"
     --save-interval 100
     --max-actor-ckpt-to-keep 2
 )
-
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_DATA}"
     --input-key prompt
@@ -59,36 +54,35 @@ ROLLOUT_ARGS=(
     --rollout-batch-size 16
     --n-samples-per-prompt 8
     --rollout-max-response-len 2048
-    --rollout-temperature 0.8
+    --rollout-temperature 1
     --rollout-top-p 1
     --rollout-top-k -1
     --global-batch-size 128
     --num-steps-per-rollout 1
     --num-iters-per-train-update 1
     --balance-data
-    --save-debug-rollout-data "${LOG_DIR}/${EXP_NAME}/rollout_data/{rollout_id}.pt"
     --use-rollout-routing-replay
-    # Miles debug_minimal: no over-sampling or dynamic reward filtering.
 )
 
 PERF_ARGS=(
     --qkv-format bshd
-    --tensor-model-parallel-size 4
-    --pipeline-model-parallel-size 1
-    --context-parallel-size 1
-    --expert-model-parallel-size 128
+    --tensor-model-parallel-size 2
+    --pipeline-model-parallel-size 2
+    --context-parallel-size 2
+    --allgather-cp
+    --calculate-per-token-loss
+    --expert-model-parallel-size 64
     --expert-tensor-parallel-size 1
     --sequence-parallel
     --micro-batch-size 1
     --max-tokens-per-gpu 2048
-    --log-probs-max-tokens-per-gpu 2048
     --data-pad-size-multiplier 128
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
+    --recompute-loss-function
     --moe-token-dispatcher-type alltoall
-    # Match the official full-model launcher: sample-mean loss, not per-token loss.
-    # No loss-function recompute or indexer replay is enabled in that launcher.
+    --moe-router-dtype fp32
 )
 
 GRPO_ARGS=(
@@ -115,6 +109,9 @@ OPTIMIZER_ARGS=(
     --optimizer-cpu-offload
     --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
+    --moe-router-load-balancing-type none
+    --moe-aux-loss-coeff 0.0
+    --no-rope-fusion
 )
 
 SGLANG_ARGS=(
@@ -136,13 +133,11 @@ SGLANG_ARGS=(
 )
 
 METRICS_ARGS=(
+    --use-clearml
     --use-metrics-service
     --tb-project-name "${PROJECT_NAME}"
     --tb-experiment-name "${EXP_NAME}-${now}"
 )
-if [ "${USE_CLEARML}" = 1 ]; then
-    METRICS_ARGS+=(--use-clearml)
-fi
 
 MISC_ARGS=(
     --bf16
@@ -162,12 +157,10 @@ MISC_ARGS=(
 
 TRAIN_ARGS=(
     --resource '{"actor": [1, 128], "rollout": [1, 128]}'
-    --num-gpus-per-node "${NUM_GPUS_PER_NODE}"
+    --num-gpus-per-node 8
     --num-data-storage-units 16
     --max-staleness 0
     --colocate
-    --offload-train
-    --offload-rollout
     "${MODEL_ARGS[@]}" "${CKPT_ARGS[@]}" "${ROLLOUT_ARGS[@]}" "${PERF_ARGS[@]}"
     "${GRPO_ARGS[@]}" "${OPTIMIZER_ARGS[@]}" "${SGLANG_ARGS[@]}" "${METRICS_ARGS[@]}" "${MISC_ARGS[@]}"
     "$@"
@@ -216,11 +209,6 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
     exit 0
 fi
 
-RAY_JOB_ADDRESS="${RAY_DASHBOARD_ADDRESS:-${RAY_ADDRESS:-http://127.0.0.1:8265}}"
-if [[ "${RAY_JOB_ADDRESS}" != http://* && "${RAY_JOB_ADDRESS}" != https://* ]]; then
-    echo "Set RAY_DASHBOARD_ADDRESS to the existing cluster's Ray Jobs HTTP address." >&2
-    exit 1
-fi
 mkdir -p "${LOG_DIR}"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOB_ADDRESS}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \

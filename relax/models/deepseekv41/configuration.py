@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""HF configuration compatibility for the Miles V4.1 text-training
+"""HF configuration compatibility for the V4.1 text-training
 architecture."""
 
 from argparse import Namespace
@@ -68,8 +68,7 @@ def hf_config_dict(config: Any) -> dict[str, Any]:
 
 
 def normalize_text_config(config: Any) -> dict[str, Any]:
-    """Accept both the original composite checkpoint and Miles' flattened
-    checkpoint."""
+    """Accept both composite checkpoints and flattened text checkpoints."""
     original = hf_config_dict(config)
     if original.get("model_type") not in ("deepseek_v41", "deepseek_v41_text"):
         raise ValueError("DeepSeek V4.1 Bridge requires a deepseek_v41 checkpoint configuration.")
@@ -135,7 +134,7 @@ def configure_runtime(provider: Any, args: Namespace) -> None:
 
     if getattr(args, "mtp_num_layers", None):
         raise ValueError(
-            "DeepSeek V4.1 currently follows Miles' text-only recipe; MTP/DSpark training is unsupported."
+            "DeepSeek V4.1 supports text-only training; MTP/DSpark training is unsupported."
         )
     provider.mtp_num_layers = None
     configure_execution_runtime(provider, args)

@@ -58,7 +58,7 @@ def test_bf16_checkpoint_allows_fp32_constants_and_frozen_quantized_tables(tmp_p
     assert (path / "config.json").read_bytes() == before
 
 
-def test_bf16_checkpoint_accepts_flattened_miles_config(tmp_path: Path) -> None:
+def test_bf16_checkpoint_accepts_flattened_config(tmp_path: Path) -> None:
     path = _checkpoint(tmp_path / "flat")
     config = json.loads((path / "config.json").read_text())["text_config"]
     config["model_type"] = "deepseek_v41"

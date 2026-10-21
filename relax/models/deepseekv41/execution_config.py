@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Execution limits of the Miles-compatible V4.1 text model, not HF
+"""Execution limits of the V4.1 text model, not HF
 architecture overrides."""
 
 from argparse import Namespace
@@ -87,7 +87,7 @@ def validate_execution_config(provider: Any) -> None:
     dtype = str(provider.params_dtype).removeprefix("torch.")
     if dtype != "bfloat16" or getattr(provider, "fp8", None) or getattr(provider, "fp4", None):
         raise ValueError(
-            "DeepSeek V4.1 currently follows Miles' BF16 training recipe; FP16/FP32/FP8/FP4 compute is unsupported."
+            "DeepSeek V4.1 requires BF16 training; FP16/FP32/FP8/FP4 compute is unsupported."
         )
     for field, expected in (("kv_lora_rank", 512), ("qk_pos_emb_head_dim", 64), ("csa_window_size", 128)):
         actual = getattr(provider, field)

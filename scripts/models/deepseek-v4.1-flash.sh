@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Full DeepSeek-V4.1-Flash text decoder, using a Miles-style BF16 checkpoint.
+# Full DeepSeek-V4.1-Flash text decoder, using a BF16 checkpoint.
 # The Bridge reads compression, retrieval, mHC and Engram topology from HF config.
 # Vision, MTP and DSpark are not part of this text-training recipe.
 

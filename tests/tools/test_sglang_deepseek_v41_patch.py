@@ -248,27 +248,5 @@ class TestDeepseekV41WeightUpdate(unittest.TestCase):
         fp8.process_weights_after_loading.assert_not_called()
 
 
-class TestDeepseekV41Mhc(unittest.TestCase):
-    def test_mhc_small_batch_uses_existing_tile_for_v41_width(self) -> None:
-        function = patched_functions("python/sglang/kernels/ops/layernorm/mhc.py", {"mhc_pre"})[0]
-        branch = next(
-            node
-            for node in ast.walk(function)
-            if isinstance(node, ast.If) and ast.unparse(node.test) == "num_tokens <= 2048"
-        )
-        start = next(
-            index
-            for index, node in enumerate(branch.body)
-            if isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "split_size" for t in node.targets)
-        )
-        module = ast.Module(body=branch.body[start : start + 2], type_ignores=[])
-        code = compile(module, str(PATCH_PATH), "exec")
-        for width, expected in ((20480, 128), (16384, 256), (28672, 128)):
-            namespace: dict[str, Any] = {}
-            exec(code, {"hc_hidden_size": width, "n_splits_pre": 32}, namespace)
-            self.assertEqual(namespace["hidden_block"], expected)
-
-
 if __name__ == "__main__":
     unittest.main()

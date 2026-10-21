@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# CharyZeng/DeepSeek-V4.1-4layer, as used by Miles' eight-GPU CI.
+# CharyZeng/DeepSeek-V4.1-4layer text model.
 # This is NOT the first four layers of DeepSeek-V4.1-Flash. The checkpoint
 # supplies compress_ratios=[0,2,1,1], KV sources [1,2], index sources [1,2,3],
 # candidate source 2 and Engram at layer 0. The V4.1 Bridge reads that topology
 # from config.json; these CLI flags only describe the matching model shape.
-# Use the same prepared BF16 checkpoint and tokenizer in both frameworks.
+# Use the same prepared BF16 checkpoint and tokenizer for training and rollout.
 
 MODEL_ARGS=(
     --num-layers 4

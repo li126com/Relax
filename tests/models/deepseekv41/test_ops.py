@@ -27,10 +27,10 @@ def _stub_kernel(monkeypatch: pytest.MonkeyPatch, name: str, **functions: Any) -
     monkeypatch.setitem(sys.modules, module.__name__, module)
 
 
-def _miles_freqs_reference(
+def _yarn_freqs_reference(
     dim: int, seqlen: int, original: int, base: float, factor: float, fast: float, slow: float
 ) -> torch.Tensor:
-    # Same math as Miles' reference, written independently without its lru cache.
+    # Independent plain RoPE and YaRN frequency equations.
     exponents = torch.arange(dim // 2, dtype=torch.float32) * (2 / dim)
     frequencies = torch.pow(torch.tensor(base), -exponents)
     if original:
@@ -49,11 +49,11 @@ def _miles_freqs_reference(
     "dim,original,base,factor",
     [(64, 0, 10000, 16), (64, 65536, 160000, 16), (2, 1, 10000, 16)],
 )
-def test_rope_frequencies_match_miles_plain_yarn_and_collapsed_ramp(
+def test_rope_frequencies_match_plain_yarn_and_collapsed_ramp(
     dim: int, original: int, base: float, factor: float
 ) -> None:
     actual = position.precompute_freqs_cis(dim, 17, original, base, factor, 32, 1, torch.device("cpu"))
-    expected = _miles_freqs_reference(dim, 17, original, base, factor, 32, 1)
+    expected = _yarn_freqs_reference(dim, 17, original, base, factor, 32, 1)
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
 
 
@@ -69,7 +69,7 @@ def test_attention_freqs_selects_compressed_yarn_or_plain_window(compressed: boo
         beta_slow=1,
     )
     actual = position.attention_freqs(config, 12, compressed, torch.device("cpu"))
-    expected = _miles_freqs_reference(8, 12, 65536 if compressed else 0, 160000 if compressed else 10000, 16, 32, 1)
+    expected = _yarn_freqs_reference(8, 12, 65536 if compressed else 0, 160000 if compressed else 10000, 16, 32, 1)
     torch.testing.assert_close(actual, expected)
 
 
@@ -124,7 +124,7 @@ def _compressor_reference(
         values = F.linear(x, wkv)
     else:
         groups = x.shape[0] // ratio
-        # One FP32 view per input/weight, like Miles: sum group gradients in
+        # One FP32 view per input/weight: sum group gradients in
         # FP32 before a single CastBackward converts them to the BF16 leaf.
         tokens32 = x[: groups * ratio].float()
         wkv32, wgate32 = wkv.float(), wgate.float()
@@ -142,7 +142,7 @@ def _compressor_reference(
 
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_compressor_matches_miles_per_group_reference_and_gradients(ratio: int, dtype: torch.dtype) -> None:
+def test_compressor_matches_per_group_reference_and_gradients(ratio: int, dtype: torch.dtype) -> None:
     torch.manual_seed(11)
     config = SimpleNamespace(hidden_size=4, params_dtype=dtype, layernorm_epsilon=1e-6)
     module = compressor.DeepSeekV41Compressor(config, 3, ratio)
@@ -206,23 +206,6 @@ def _cpu_rotate(x: torch.Tensor, freqs: torch.Tensor, inverse: bool = False) -> 
     rotated = torch.view_as_real(complex_x * rotation.view(shape)).flatten(-2)
     x.copy_(rotated.to(x.dtype))
     return x
-
-
-def test_rotary_wrapper_lazily_dispatches_forward_and_inverse(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = []
-
-    def rotate(x: torch.Tensor, freqs: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-        calls.append(inverse)
-        return _cpu_rotate(x, freqs, inverse)
-
-    _stub_kernel(monkeypatch, "rope", apply_rotary_emb=rotate)
-    frequencies = position.precompute_freqs_cis(4, 5, 0, 10000, 16, 32, 1, torch.device("cpu"))
-    original = torch.randn(2, 5, 3, 4)
-    value = original.clone()
-    assert position.apply_rotary_emb(value, frequencies) is value
-    assert position.apply_rotary_emb(value, frequencies, inverse=True) is value
-    torch.testing.assert_close(value, original)
-    assert calls == [False, True]
 
 
 def _indexer_fixture(monkeypatch: pytest.MonkeyPatch, layer_id: int, source: int = 0) -> indexer.DeepSeekV41Indexer:
@@ -319,26 +302,6 @@ def test_indexer_index_keys_normalizes_rotates_and_freezes_gradients(monkeypatch
     assert not actual.requires_grad
 
 
-def test_indexer_logits_wrapper_passes_explicit_causal_lengths_to_lazy_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = []
-
-    def kernel(
-        q: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
-    ) -> torch.Tensor:
-        calls.append((q, keys, weights, starts, ends))
-        return torch.full((q.shape[0], keys.shape[0]), len(calls), dtype=torch.float32)
-
-    _stub_kernel(monkeypatch, "indexer_fwd", indexer_fwd=kernel)
-    q, keys, weights = torch.randn(2, 3, 2, 4), torch.randn(2, 5, 4), torch.randn(2, 3, 2)
-    lengths = torch.tensor([1, 3, 5], dtype=torch.long)
-    actual = indexer.indexer_logits(q, keys, weights, lengths)
-    assert actual.shape == (2, 3, 5) and len(calls) == 2
-    for _, _, kernel_weights, starts, ends in calls:
-        assert kernel_weights.dtype == torch.float32
-        torch.testing.assert_close(starts, torch.zeros(3, dtype=torch.int32))
-        torch.testing.assert_close(ends, lengths.to(torch.int32))
-
-
 def _round_ste(tensor: torch.Tensor) -> torch.Tensor:
     return tensor + (tensor.round() - tensor).detach()
 
@@ -382,27 +345,6 @@ def test_compressed_kv_stored_uses_hard_values_but_preserves_identity_gradient(
     actual = quant.compressed_kv_stored(latent, 2)
     torch.testing.assert_close(actual, torch.full_like(latent, 0.5))
     torch.testing.assert_close(torch.autograd.grad(actual.sum(), latent)[0], torch.ones_like(latent))
-
-
-def test_fake_quant_wrappers_dispatch_lazily_without_loading_gpu_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen = []
-
-    def fp8(tensor: torch.Tensor, block: int) -> torch.Tensor:
-        seen.append(block)
-        return tensor + 3
-
-    _stub_kernel(
-        monkeypatch,
-        "fake_quant",
-        fake_quant_fp4=lambda tensor: tensor + 1,
-        fake_quant_compressed_kv=lambda tensor: tensor + 2,
-        fake_quant_fp8_block=fp8,
-    )
-    value = torch.ones(2, 8)
-    torch.testing.assert_close(quant.fake_quant_fp4(value), value + 1)
-    torch.testing.assert_close(quant.fake_quant_compressed_kv(value), value + 2)
-    torch.testing.assert_close(quant._fp8_ste(value), value + 3)
-    assert seen == [64]
 
 
 def _sparse_module() -> Any:

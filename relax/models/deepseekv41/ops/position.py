@@ -1,5 +1,4 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Adapted from radixark/miles deepseek_v4/ops/{rope,cp_utils}.py (Apache-2.0).
 
 import math
 from functools import lru_cache

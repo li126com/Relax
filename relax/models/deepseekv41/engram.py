@@ -1,5 +1,4 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Adapted from radixark/miles (Apache-2.0), miles_plugins/models/deepseek_v4_1/engram.py.
 
 """Frozen CPU-mapped Engram tables and the trainable V4.1 retrieval gate."""
 

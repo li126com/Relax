@@ -1,5 +1,4 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Adapted from radixark/miles (Apache-2.0), miles_plugins/models/deepseek_v4_1/deepseek_v4_1.py.
 
 """V4.1 text execution with model-instance-owned cross-layer state."""
 
@@ -42,7 +41,7 @@ class V41HyperConnection(HyperConnectionModule):
     def __init__(self, config: TransformerConfig, layer_number: int, runtime: V41Runtime) -> None:
         super().__init__(config, layer_number)
         self.v41_runtime = runtime
-        # Miles uses the checkpoint's RMS epsilon for projection normalization,
+        # Use the checkpoint's RMS epsilon for projection normalization,
         # and the mHC epsilon for the sigmoid floor and Sinkhorn iterations.
         self.norm_eps = config.layernorm_epsilon
         self.compute_h_eps = config.v41_hc_eps
@@ -195,8 +194,7 @@ def get_v41_spec(
 
 
 def _freeze_routers(model: GPTModel) -> None:
-    """Match Miles' frozen routing policy without disabling gradients through
-    routing inputs."""
+    """Freeze routing weights while preserving gradients through routing inputs."""
     for layer in model.decoder.layers:
         router = getattr(layer.mlp, "router", None)
         if router is not None:
@@ -282,7 +280,7 @@ class DeepSeekV41GPTModel(GPTModel):
         output_processor_context: Any = None,
     ) -> torch.Tensor:
         if packed_seq_params is not None:
-            raise NotImplementedError("DeepSeek V4.1 Miles-style attention does not support packed sequences.")
+            raise NotImplementedError("DeepSeek V4.1 attention does not support packed sequences.")
         if inference_context is not None or inference_params is not None:
             raise NotImplementedError(
                 "DeepSeek V4.1 Megatron execution currently supports training, not KV-cache inference."

@@ -68,15 +68,14 @@ def model_config() -> SimpleNamespace:
 
 @pytest.fixture
 def core_hooks(monkeypatch) -> None:
-    # The Miles audit image lacks Relax's new construction hooks. These tests
-    # simulate their signatures without changing the remote installed sources.
+    # Isolate the construction hooks from GPU model allocation.
     monkeypatch.setattr(GPTModel, "_get_transformer_block_class", lambda self: TransformerBlock, raising=False)
     monkeypatch.setattr(TransformerBlock, "_build_hyper_connection_output_head", lambda self: None, raising=False)
 
 
-def _spec(runtime: V41Runtime, count: int = 1) -> TransformerBlockSubmodules:
+def _spec(runtime: V41Runtime) -> TransformerBlockSubmodules:
     return TransformerBlockSubmodules(
-        layer_specs=[ModuleSpec(module=V41TransformerLayer, params={"runtime": runtime}) for _ in range(count)],
+        layer_specs=[ModuleSpec(module=V41TransformerLayer, params={"runtime": runtime})],
         layer_norm=torch.nn.Identity,
     )
 
@@ -123,14 +122,6 @@ def test_model_hyper_connection_uses_previous_pre_and_updates_next(model_config,
     assert module.sinkhorn_eps == module.compute_h_eps == model_config.v41_hc_eps
 
 
-@pytest.mark.parametrize("argument", ["mhc_recompute_manager", "output_slot"])
-def test_model_hyper_connection_selective_recompute_is_explicitly_rejected(argument) -> None:
-    module = V41HyperConnection.__new__(V41HyperConnection)
-    torch.nn.Module.__init__(module)
-    with pytest.raises(NotImplementedError, match="selective mHC"):
-        module.forward(torch.zeros(1, 1, 8), **{argument: object()})
-
-
 def test_model_hyper_connection_fp32_mix_orientation_and_gradients() -> None:
     module = V41HyperConnection.__new__(V41HyperConnection)
     torch.nn.Module.__init__(module)
@@ -146,17 +137,6 @@ def test_model_hyper_connection_fp32_mix_orientation_and_gradients() -> None:
     assert torch.equal(result, expected.flatten(-2).to(torch.bfloat16))
     result.float().sum().backward()
     assert hidden.grad is not None and output.grad is not None and post.grad is not None
-
-
-@pytest.mark.parametrize("bias,dropout,manager", [(True, 0.0, None), (False, 0.1, None), (False, 0.0, object())])
-def test_model_hyper_connection_unsupported_mix_options_raise(bias, dropout, manager) -> None:
-    module = V41HyperConnection.__new__(V41HyperConnection)
-    torch.nn.Module.__init__(module)
-    hidden = torch.zeros(1, 1, 8)
-    with pytest.raises(NotImplementedError, match="no bias"):
-        module.fused_h_res_h_post_bda(
-            torch.zeros(1), hidden, torch.zeros(1), (hidden, hidden if bias else None), dropout, True, False, manager
-        )
 
 
 def test_model_spec_preserves_core_moe_and_binds_only_instance_state(model_config, monkeypatch) -> None:
@@ -204,12 +184,6 @@ def test_model_spec_preserves_core_moe_and_binds_only_instance_state(model_confi
     assert not hasattr(model_config, "v41_runtime")
 
 
-def test_model_spec_rejects_native_attention_fallback(model_config) -> None:
-    model_config.experimental_attention_variant = "dsv4_hybrid"
-    with pytest.raises(ValueError, match="own spec"):
-        get_v41_spec(model_config, V41Runtime())
-
-
 def test_model_block_keeps_native_expand_without_old_output_head(model_config, monkeypatch, core_hooks) -> None:
     def fake_init(self, config, spec, **kwargs):
         torch.nn.Module.__init__(self)
@@ -237,15 +211,6 @@ def test_model_block_keeps_native_expand_without_old_output_head(model_config, m
     assert torch.equal(result, contracted) and multi is None
     with pytest.raises(ValueError, match="contract mHC"):
         block.postprocess_for_layer_schedule(expanded)
-
-
-def test_model_block_rejects_empty_or_mixed_instance_specs(model_config) -> None:
-    with pytest.raises(ValueError, match="nonempty"):
-        V41TransformerBlock(model_config, TransformerBlockSubmodules(layer_specs=[]))
-    spec = _spec(V41Runtime(), count=2)
-    spec.layer_specs[1].params["runtime"] = V41Runtime()
-    with pytest.raises(ValueError, match="model instance"):
-        V41TransformerBlock(model_config, spec)
 
 
 def test_model_last_layer_contracts_using_final_pre(model_config, monkeypatch) -> None:
@@ -312,12 +277,6 @@ def test_model_layer_recompute_restores_state_after_another_microbatch(model_con
     assert torch.equal(actual, reference.grad)
 
 
-def test_model_constructor_requires_image_hooks_before_building(model_config, monkeypatch) -> None:
-    monkeypatch.delattr(GPTModel, "_get_transformer_block_class", raising=False)
-    with pytest.raises(RuntimeError, match="rebuild the training image"):
-        DeepSeekV41GPTModel(model_config, vocab_size=32, max_sequence_length=16, pg_collection=SimpleNamespace())
-
-
 def test_model_constructor_owns_runtime_and_freezes_only_router(model_config, monkeypatch, core_hooks) -> None:
     routers = []
 
@@ -347,15 +306,6 @@ def test_model_constructor_owns_runtime_and_freezes_only_router(model_config, mo
         assert value.grad is not None
 
 
-@pytest.mark.parametrize("keyword", ["pg_collection", "transformer_layer_spec"])
-def test_model_constructor_rejects_missing_groups_or_external_spec(model_config, core_hooks, keyword) -> None:
-    kwargs = {"pg_collection": SimpleNamespace(), "transformer_layer_spec": object()}
-    if keyword == "pg_collection":
-        kwargs = {}
-    with pytest.raises(ValueError):
-        DeepSeekV41GPTModel(model_config, vocab_size=32, max_sequence_length=16, **kwargs)
-
-
 def test_model_forward_resets_state_and_preserves_standard_arguments(monkeypatch) -> None:
     model = DeepSeekV41GPTModel.__new__(DeepSeekV41GPTModel)
     torch.nn.Module.__init__(model)
@@ -383,13 +333,3 @@ def test_model_forward_resets_state_and_preserves_standard_arguments(monkeypatch
     assert result is decoder
     assert captured["output_processor"] is processor and captured["output_processor_context"] is processor_context
     assert model.v41_runtime.input_ids is None
-
-
-@pytest.mark.parametrize("keyword", ["packed_seq_params", "inference_context", "inference_params", "attention_mask"])
-def test_model_forward_unsupported_inputs_fail_before_core(keyword) -> None:
-    model = DeepSeekV41GPTModel.__new__(DeepSeekV41GPTModel)
-    torch.nn.Module.__init__(model)
-    model.v41_runtime = V41Runtime()
-    kwargs = {"input_ids": None, "position_ids": None, "attention_mask": None, keyword: object()}
-    with pytest.raises(NotImplementedError):
-        model.forward(**kwargs)

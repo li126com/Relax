@@ -65,7 +65,7 @@ SFT_ARGS=(
     --sft-tq-timeout-minutes 60
     --sft-oversize-strategy skip
     --balance-data
-    # Relax alignment: 2 * CP2 * TP2 * 512 = 4096 (Miles uses TP2 * 2048).
+    # Padding alignment: 2 * CP2 * TP2 * 512 = 4096.
     --data-pad-size-multiplier 1024
 )
 

@@ -10,7 +10,7 @@ from megatron.core.models.gpt import GPTModel
 
 @dataclass
 class DeepSeekV41ModelProvider(MLAModelProvider):
-    """V4.1 text architecture and its Miles-compatible execution provider."""
+    """V4.1 text architecture and execution provider."""
 
     experimental_attention_variant: str | None = None
     mtp_num_layers: int | None = None

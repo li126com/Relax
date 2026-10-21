@@ -252,8 +252,8 @@ RUN . /etc/relax_build.env && \
     CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:${PATH} GPU_ARCH="${GPU_ARCH}" \
     python /tmp/build_flashinfer_sampling.py
 
-COPY docker/patch/sglang/v0.5.17.patch /sgl-workspace/sglang/sglang.patch
-COPY docker/patch/sglang/v0.5.17-per-pos-topk.patch /sgl-workspace/sglang/sglang_per_pos_topk.patch
+COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     cd /sgl-workspace/sglang && git add . && \
     sha256sum sglang.patch > /etc/relax-sglang-patch.sha256 && \

@@ -40,7 +40,7 @@ RUN FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS="90;100" MAX_JOBS=64 
     pip -v install flash-attn==2.7.4.post1 --force-reinstall --no-deps --no-build-isolation --no-cache-dir && \
     pip install --no-cache-dir flash-linear-attention==0.5.2
 
-# Keep TileLang 0.1.12; port Miles' Blackwell FP16 vector-store fix.
+# Keep TileLang 0.1.12 with the Blackwell FP16 vector-store fix.
 COPY docker/patch/tilelang/0.1.12-blackwell-fp16-store.patch /tmp/tilelang-blackwell-fp16-store.patch
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("tilelang").origin).parent)')" && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/tilelang-blackwell-fp16-store.patch

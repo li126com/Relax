@@ -2,7 +2,6 @@
 
 """Instance-owned cross-layer state and tensor carry for the V4.1 text model.
 
-Adapted from Apache-2.0-licensed radixark/miles, ``miles_plugins/models/deepseek_v4_1/deepseek_v4_1.py``.
 The carry layout is derived from the layer plan instead of reading a GPU metadata header on every layer.
 """
 

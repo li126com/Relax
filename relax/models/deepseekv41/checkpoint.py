@@ -11,7 +11,7 @@ from typing import Any
 
 _V41_MODEL_TYPES = {"deepseek_v41", "deepseek_v41_text"}
 _BF16_REQUIRED = (
-    "DeepSeek V4.1 requires a Miles-style BF16 train/rollout checkpoint: dequantize trainable FP8/FP4 weights, "
+    "DeepSeek V4.1 requires a BF16 train/rollout checkpoint: dequantize trainable FP8/FP4 weights, "
     "remove quantization_config and obsolete weight scales, and retain frozen Engram embed weights/scales. "
     "Online synchronization into the original quantized checkpoint is not supported."
 )

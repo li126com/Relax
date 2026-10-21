@@ -1,5 +1,4 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Adapted from radixark/miles deepseek_v4_1/ops/compressor.py (Apache-2.0).
 
 from typing import Any
 

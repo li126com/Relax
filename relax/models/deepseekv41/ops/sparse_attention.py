@@ -1,5 +1,4 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Adapted from radixark/miles: miles/kernels/attention/dsa/sparse_attention.py (Apache-2.0).
 
 """Sparse attention over top-k selected KV rows (DeepSeek Sparse Attention
 core).

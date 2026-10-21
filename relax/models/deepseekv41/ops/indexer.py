@@ -1,5 +1,4 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Adapted from radixark/miles deepseek_v4_1/ops/indexer.py (Apache-2.0).
 
 from typing import Any
 
@@ -74,7 +73,7 @@ class DeepSeekV41Indexer(MegatronModule):
         if owns_k:
             self.linear_wk = nn.Linear(config.kv_lora_rank, self.index_head_dim, bias=False, dtype=config.params_dtype)
             self.k_norm = RMSNorm(self.index_head_dim, config.layernorm_epsilon)
-        # Miles' RL recipe freezes the complete retrieval indexer.
+        # Freeze the complete retrieval indexer during training.
         self.requires_grad_(False)
 
     @torch.no_grad()

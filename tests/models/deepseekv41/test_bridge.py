@@ -356,7 +356,7 @@ def test_default_builder_cannot_bypass_v41_execution_gate(bridge: DeepSeekV41Bri
         ("v41_engram.k_weight", "engram.k_weight", ReplicatedMapping),
     ],
 )
-def test_mapping_matches_miles_names_and_tp_layout(
+def test_mapping_matches_checkpoint_names_and_tp_layout(
     bridge: DeepSeekV41Bridge, megatron_name: str, hf_name: str, mapping_type: type | None
 ) -> None:
     if not megatron_name.startswith(("embedding.", "output_layer.", "decoder.")):

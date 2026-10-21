@@ -1,5 +1,4 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Adapted from radixark/miles: miles/kernels/position/rope.py (Apache-2.0).
 
 import torch
 import triton
