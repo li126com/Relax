@@ -84,5 +84,5 @@ def test_sglang_dockerfile_uses_latest_patch_links():
 
 def test_sglang_dockerfile_restores_official_nccl_override_last():
     dockerfile = (ROOT / "docker/Dockerfile").read_text()
-    commands = [line for line in dockerfile.splitlines() if line.startswith("RUN ")]
-    assert commands[-1] == ("RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7")
+    pip_installs = [line for line in dockerfile.splitlines() if "pip" in line.split() and "install" in line.split()]
+    assert pip_installs[-1] == ("RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7")

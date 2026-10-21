@@ -99,6 +99,8 @@ def _is_record_fields_import(node: ast.AST) -> bool:
 @pytest.fixture()
 def server_args_module() -> SimpleNamespace:
     """Run complete argument builders with the real SGLang ServerArgs."""
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+
     from relax.utils.logging_utils import get_logger
     from relax.utils.s3_model_loader import is_s3_uri
 
@@ -243,24 +245,18 @@ def test_compute_genrm_server_args_accepts_installed_server_args(server_args_mod
     ],
 )
 def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
-    enable_mtp_training, speculative_algorithm, overrides, expected
+    server_args_module, enable_mtp_training, speculative_algorithm, overrides, expected
 ):
-    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
-
-    from relax.backends.sglang.sglang_engine import _enable_draft_weights_cpu_backup
-
     args = SimpleNamespace(
         enable_mtp_training=enable_mtp_training,
         sglang_speculative_algorithm=speculative_algorithm,
     )
 
-    assert _enable_draft_weights_cpu_backup(args, overrides) is expected
+    assert server_args_module._enable_draft_weights_cpu_backup(args, overrides) is expected
 
 
 def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, sglang_engine_module):
     from unittest.mock import Mock
-
-    from relax.utils import misc
 
     module = sglang_engine_module
     engine = object.__new__(module.SGLangEngine)
@@ -279,8 +275,10 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, sglang_engine_mo
     }
     get = Mock(return_value=response)
     config = Mock(return_value=SimpleNamespace(text_config=SimpleNamespace(num_experts=896)))
+    misc = ModuleType("relax.utils.misc")
+    misc.get_hf_config = config
+    monkeypatch.setitem(sys.modules, misc.__name__, misc)
     monkeypatch.setattr(module.requests, "get", get)
-    monkeypatch.setattr(misc, "get_hf_config", config)
     result = engine.get_expert_weight_sync_layout()
     assert result["enable_eplb"] is True
     assert result["num_experts"] == 896
