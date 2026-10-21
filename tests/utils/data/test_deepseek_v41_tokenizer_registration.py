@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Tokenizer registration order without importing ML dependencies or the model package."""
+"""Tokenizer registration order without importing ML dependencies or the model
+package."""
 
 from __future__ import annotations
 

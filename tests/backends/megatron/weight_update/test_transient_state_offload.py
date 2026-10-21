@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU-only tests for model-owned transient state at the colocate sleep boundary."""
+"""CPU-only tests for model-owned transient state at the colocate sleep
+boundary."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace

@@ -166,7 +166,8 @@ def _pack_bshd_routing_replay(
     cp_rank: int,
     pad_func: Callable[[torch.Tensor, int], torch.Tensor],
 ) -> torch.Tensor:
-    """Match BSHD forward's per-sample CP slices and sequence-major MoE flattening."""
+    """Match BSHD forward's per-sample CP slices and sequence-major MoE
+    flattening."""
     if not routed_experts or len(routed_experts) != len(max_seq_lens):
         raise ValueError("BSHD routing replay requires max_seq_lens for every sample.")
     max_seq_len = max_seq_lens[0]

@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Adapted from radixark/miles: miles/kernels/attention/dsa/sparse_attention.py (Apache-2.0).
 
-"""Sparse attention over top-k selected KV rows (DeepSeek Sparse Attention core).
+"""Sparse attention over top-k selected KV rows (DeepSeek Sparse Attention
+core).
 
 q [B, S, H, d_v + d_tail] bf16, kv [B, S_kv, G, d_v + d_tail] bf16, indices [B, S, G, topk] int32 with
 -1 as padding, attn_sink [H] fp32 or None. GLM-5 / DeepSeek-V3.2 pass a RoPE tail (d_tail > 0) and
@@ -199,8 +200,11 @@ def sparse_attention(
     attn_sink: torch.Tensor | None = None,
     config: SparseAttentionConfig | None = None,
 ) -> torch.Tensor:
-    """Returns out [B, S, H, d_v] bf16. ``d_v`` defaults to the full head dim (no RoPE tail).
-    ``config`` defaults to the measured row for this arch and shape."""
+    """Returns out [B, S, H, d_v] bf16.
+
+    ``d_v`` defaults to the full head dim (no RoPE tail). ``config`` defaults
+    to the measured row for this arch and shape.
+    """
     if d_v is None:
         d_v = q.shape[-1]
     if config is None:

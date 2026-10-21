@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU conversion tests, run with the Bridge/Transformers training-image dependencies."""
+"""CPU conversion tests, run with the Bridge/Transformers training-image
+dependencies."""
 
 from __future__ import annotations
 
@@ -40,7 +41,8 @@ from relax.models.deepseekv41.provider import DeepSeekV41ModelProvider  # noqa: 
 
 @pytest.fixture
 def checkpoint_config() -> dict[str, Any]:
-    """Original nested schema, reduced dimensions, and no external model-directory dependency."""
+    """Original nested schema, reduced dimensions, and no external model-
+    directory dependency."""
     return {
         "architectures": ["DeepseekV41ForCausalLM"],
         "model_type": "deepseek_v41",

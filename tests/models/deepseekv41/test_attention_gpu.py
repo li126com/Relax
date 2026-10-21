@@ -13,7 +13,6 @@ import json
 import os
 import sys
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,9 +28,19 @@ pytestmark = pytest.mark.skipif(
 def _compare(actual: Tensor, expected: Tensor, name: str, tolerance: float) -> None:
     difference = actual.double() - expected.double()
     error, norm = difference.norm().item(), expected.double().norm().item()
-    print(json.dumps({"name": name, "dtype": str(actual.dtype), "shape": list(actual.shape),
-                      "rel_l2": error / max(norm, 1e-12), "max_abs": difference.abs().max().item(),
-                      "tolerance": tolerance}), flush=True)
+    print(
+        json.dumps(
+            {
+                "name": name,
+                "dtype": str(actual.dtype),
+                "shape": list(actual.shape),
+                "rel_l2": error / max(norm, 1e-12),
+                "max_abs": difference.abs().max().item(),
+                "tolerance": tolerance,
+            }
+        ),
+        flush=True,
+    )
     assert torch.isfinite(actual).all(), name
     assert error <= tolerance * norm + 1e-7, name
 
@@ -47,11 +56,16 @@ def _dense_sparse_oracle(q: Tensor, kv: Tensor, indices: Tensor, sink: Tensor) -
     return torch.einsum("bshk,bskd->bshd", weights, keys)
 
 
-@pytest.mark.parametrize("backend,seq,topk,batch,heads", [("tilelang", 37, 65, 2, 8),
-                                                        ("flash_mla", 37, 65, 2, 8),
-                                                        ("tilelang", 160, 128, 1, 8),
-                                                        ("flash_mla", 160, 128, 1, 32),
-                                                        ("flash_mla", 37, 640, 1, 64)])
+@pytest.mark.parametrize(
+    "backend,seq,topk,batch,heads",
+    [
+        ("tilelang", 37, 65, 2, 8),
+        ("flash_mla", 37, 65, 2, 8),
+        ("tilelang", 160, 128, 1, 8),
+        ("flash_mla", 160, 128, 1, 32),
+        ("flash_mla", 37, 640, 1, 64),
+    ],
+)
 def test_sparse_attention_matches_dense_formula(backend: str, seq: int, topk: int, batch: int, heads: int) -> None:
     from relax.models.deepseekv41.ops.sparse_attention import SparseAttentionConfig, sparse_attention
 
@@ -67,10 +81,18 @@ def test_sparse_attention_matches_dense_formula(backend: str, seq: int, topk: in
     dout = torch.randn_like(q) * 0.03
     leaves = [value.detach().float().requires_grad_() for value in (q, kv, sink)]
     reference = _dense_sparse_oracle(leaves[0], leaves[1], indices, leaves[2])
-    output = sparse_attention(q, kv, indices, 512**-0.5, attn_sink=sink,
-                              config=SparseAttentionConfig(forward_backend=backend,
-                                                           forward_threads=128 if heads < 32 else 256,
-                                                           backward_split_store=4 if heads >= 32 else 2))
+    output = sparse_attention(
+        q,
+        kv,
+        indices,
+        512**-0.5,
+        attn_sink=sink,
+        config=SparseAttentionConfig(
+            forward_backend=backend,
+            forward_threads=128 if heads < 32 else 256,
+            backward_split_store=4 if heads >= 32 else 2,
+        ),
+    )
     output.backward(dout)
     reference.backward(dout.float())
     prefix = f"sparse/seed271/{backend}/b{batch}s{seq}h{heads}k{topk}"
@@ -159,22 +181,44 @@ def test_quantization_matches_codebook_and_straight_through_gradient(kind: str, 
 def _config(ratios: list[int], cp_size: int, tp_size: int = 1, sequence_parallel: bool = False):
     from megatron.core.transformer.transformer_config import TransformerConfig
 
-    config = TransformerConfig(num_layers=len(ratios), hidden_size=64, num_attention_heads=8,
-                               ffn_hidden_size=128, params_dtype=torch.bfloat16, bf16=True,
-                               normalization="RMSNorm", gradient_accumulation_fusion=False,
-                               tensor_model_parallel_size=tp_size, sequence_parallel=sequence_parallel,
-                               context_parallel_size=cp_size, attention_dropout=0.0, hidden_dropout=0.0)
-    for name, value in dict(q_lora_rank=32, o_lora_rank=32, kv_lora_rank=512, qk_pos_emb_head_dim=64,
-                            o_groups=2, csa_window_size=128, csa_compress_ratios=ratios,
-                            v41_kv_source_layer_ids=tuple(i for i, ratio in enumerate(ratios)
-                                                          if ratio and ratio not in ratios[:i]),
-                            v41_index_source_layer_ids=tuple(i for i, ratio in enumerate(ratios) if ratio),
-                            dsa_indexer_n_heads=8, dsa_indexer_head_dim=128, dsa_indexer_topk=32,
-                            v41_candidate_source_layer_id=2 if len(ratios) == 4 else -1,
-                            v41_candidate_topk_blocks=4,
-                            v41_candidate_block_size=8, original_max_position_embeddings=8192,
-                            rotary_base=10000.0, csa_compress_rotary_base=160000.0,
-                            rotary_scaling_factor=1.0, beta_fast=32.0, beta_slow=1.0).items():
+    config = TransformerConfig(
+        num_layers=len(ratios),
+        hidden_size=64,
+        num_attention_heads=8,
+        ffn_hidden_size=128,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        normalization="RMSNorm",
+        gradient_accumulation_fusion=False,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=sequence_parallel,
+        context_parallel_size=cp_size,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    for name, value in dict(
+        q_lora_rank=32,
+        o_lora_rank=32,
+        kv_lora_rank=512,
+        qk_pos_emb_head_dim=64,
+        o_groups=2,
+        csa_window_size=128,
+        csa_compress_ratios=ratios,
+        v41_kv_source_layer_ids=tuple(i for i, ratio in enumerate(ratios) if ratio and ratio not in ratios[:i]),
+        v41_index_source_layer_ids=tuple(i for i, ratio in enumerate(ratios) if ratio),
+        dsa_indexer_n_heads=8,
+        dsa_indexer_head_dim=128,
+        dsa_indexer_topk=32,
+        v41_candidate_source_layer_id=2 if len(ratios) == 4 else -1,
+        v41_candidate_topk_blocks=4,
+        v41_candidate_block_size=8,
+        original_max_position_embeddings=8192,
+        rotary_base=10000.0,
+        csa_compress_rotary_base=160000.0,
+        rotary_scaling_factor=1.0,
+        beta_fast=32.0,
+        beta_slow=1.0,
+    ).items():
         setattr(config, name, value)
     return config
 
@@ -197,24 +241,38 @@ def _cp_worker() -> None:
     tp = parallel_state.get_tensor_model_parallel_group()
     group = dist.group.WORLD
     try:
-        for case, ratios, seqlen, batch in (("window", [0], 160, 2),
-                                            ("ratio2", [2], 160, 1),
-                                            ("reuse", [0, 2, 1, 1], 160, 1)):
+        for case, ratios, seqlen, batch in (
+            ("window", [0], 160, 2),
+            ("ratio2", [2], 160, 1),
+            ("reuse", [0, 2, 1, 1], 160, 1),
+        ):
             torch.manual_seed(293)
             runtime = V41Runtime()
             config = _config(ratios, 1)
-            reference = torch.nn.ModuleList([DeepSeekV41Attention(config, runtime, layer_number=i + 1,
-                                              pg_collection=ProcessGroupCollection(tp=tp, cp=None))
-                                             for i in range(len(ratios))]).cuda()
+            reference = torch.nn.ModuleList(
+                [
+                    DeepSeekV41Attention(
+                        config, runtime, layer_number=i + 1, pg_collection=ProcessGroupCollection(tp=tp, cp=None)
+                    )
+                    for i in range(len(ratios))
+                ]
+            ).cuda()
             with torch.no_grad():
                 for layer in reference:
                     layer.core_attention.attn_sink.copy_(torch.linspace(-0.5, 0.5, 8, device="cuda"))
             candidate_runtime = V41Runtime()
             candidate_config = _config(ratios, 2)
-            candidate = torch.nn.ModuleList([DeepSeekV41Attention(candidate_config, candidate_runtime,
-                                               layer_number=i + 1,
-                                               pg_collection=ProcessGroupCollection(tp=tp, cp=group))
-                                              for i in range(len(ratios))]).cuda()
+            candidate = torch.nn.ModuleList(
+                [
+                    DeepSeekV41Attention(
+                        candidate_config,
+                        candidate_runtime,
+                        layer_number=i + 1,
+                        pg_collection=ProcessGroupCollection(tp=tp, cp=group),
+                    )
+                    for i in range(len(ratios))
+                ]
+            ).cuda()
             candidate.load_state_dict(reference.state_dict())
             source = torch.randn(seqlen, batch, 64, device="cuda", dtype=torch.bfloat16) * 0.1
             upstream = torch.randn_like(source) * 0.1
@@ -234,8 +292,9 @@ def _cp_worker() -> None:
                 candidate.zero_grad(set_to_none=True)
                 local = source.chunk(2)[rank].detach().clone().requires_grad_()
                 if recompute:
-                    actual = checkpoint(lambda value: forward(candidate, candidate_runtime, value),
-                                        local, use_reentrant=True)
+                    actual = checkpoint(
+                        lambda value: forward(candidate, candidate_runtime, value), local, use_reentrant=True
+                    )
                 else:
                     actual = forward(candidate, candidate_runtime, local)
                 actual.backward(upstream.chunk(2)[rank].contiguous())
@@ -243,8 +302,9 @@ def _cp_worker() -> None:
                 _compare(actual, expected.chunk(2)[rank], prefix + "/output", 0.008)
                 _compare(local.grad, full.grad.chunk(2)[rank], prefix + "/input", 0.02)
                 parameter_grads = {}
-                for (name, parameter), (_, reference_parameter) in zip(candidate.named_parameters(),
-                                                                       reference.named_parameters(), strict=True):
+                for (name, parameter), (_, reference_parameter) in zip(
+                    candidate.named_parameters(), reference.named_parameters(), strict=True
+                ):
                     if not parameter.requires_grad:
                         assert parameter.grad is None
                         continue
@@ -300,22 +360,35 @@ def _tp_worker() -> None:
                 torch.manual_seed(307)
                 reference_runtime, candidate_runtime = V41Runtime(), V41Runtime()
                 reference_config, candidate_config = _config(ratios, 1), _config(ratios, 1, 2, sequence_parallel)
-                reference = torch.nn.ModuleList([
-                    DeepSeekV41Attention(reference_config, reference_runtime, layer_number=i + 1,
-                                         pg_collection=ProcessGroupCollection(tp=singleton, cp=None))
-                    for i in range(len(ratios))
-                ]).cuda()
-                candidate = torch.nn.ModuleList([
-                    DeepSeekV41Attention(candidate_config, candidate_runtime, layer_number=i + 1,
-                                         pg_collection=ProcessGroupCollection(tp=group, cp=None))
-                    for i in range(len(ratios))
-                ]).cuda()
+                reference = torch.nn.ModuleList(
+                    [
+                        DeepSeekV41Attention(
+                            reference_config,
+                            reference_runtime,
+                            layer_number=i + 1,
+                            pg_collection=ProcessGroupCollection(tp=singleton, cp=None),
+                        )
+                        for i in range(len(ratios))
+                    ]
+                ).cuda()
+                candidate = torch.nn.ModuleList(
+                    [
+                        DeepSeekV41Attention(
+                            candidate_config,
+                            candidate_runtime,
+                            layer_number=i + 1,
+                            pg_collection=ProcessGroupCollection(tp=group, cp=None),
+                        )
+                        for i in range(len(ratios))
+                    ]
+                ).cuda()
                 sharded_axes = {}
                 with torch.no_grad():
                     for layer in reference:
                         layer.core_attention.attn_sink.copy_(torch.linspace(-0.5, 0.5, 8, device="cuda"))
-                    for (name, parameter), (_, reference_parameter) in zip(candidate.named_parameters(),
-                                                                           reference.named_parameters(), strict=True):
+                    for (name, parameter), (_, reference_parameter) in zip(
+                        candidate.named_parameters(), reference.named_parameters(), strict=True
+                    ):
                         if name.endswith(("linear_o_group_proj", "attn_sink", "linear_q_up_proj.weight")):
                             axis = 0
                         elif name.endswith("linear_proj.weight"):
@@ -344,8 +417,9 @@ def _tp_worker() -> None:
                 input_ref = full.grad.chunk(2)[rank] if sequence_parallel else full.grad
                 _compare(actual, output_ref, prefix + "/output", 0.008)
                 _compare(local.grad, input_ref, prefix + "/input", 0.02)
-                for (name, parameter), (_, reference_parameter) in zip(candidate.named_parameters(),
-                                                                       reference.named_parameters(), strict=True):
+                for (name, parameter), (_, reference_parameter) in zip(
+                    candidate.named_parameters(), reference.named_parameters(), strict=True
+                ):
                     if not parameter.requires_grad:
                         assert parameter.grad is None
                         continue

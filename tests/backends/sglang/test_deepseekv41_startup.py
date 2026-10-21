@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""V4.1 rollout constraints using tiny on-disk checkpoint headers, never a GPU model."""
+"""V4.1 rollout constraints using tiny on-disk checkpoint headers, never a GPU
+model."""
 
 import json
 import struct

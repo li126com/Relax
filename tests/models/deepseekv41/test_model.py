@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU-only execution glue tests; no CUDA module construction or distributed job."""
+"""CPU-only execution glue tests; no CUDA module construction or distributed
+job."""
 
 from __future__ import annotations
 

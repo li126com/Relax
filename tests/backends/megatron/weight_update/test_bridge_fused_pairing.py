@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU regression for the real Bridge chunk entry point and fused-pair matcher."""
+"""CPU regression for the real Bridge chunk entry point and fused-pair
+matcher."""
 
 from argparse import Namespace
 from collections.abc import Iterator

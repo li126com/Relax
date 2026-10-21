@@ -32,7 +32,8 @@ from .provider import DeepSeekV41ModelProvider
     model_type="deepseek_v41",
 )
 class DeepSeekV41Bridge(MegatronModelBridge):
-    """Convert trainable text weights, excluding frozen Engram tables and auxiliary heads."""
+    """Convert trainable text weights, excluding frozen Engram tables and
+    auxiliary heads."""
 
     # Do not let the generic builder bypass the V4.1 provider's execution gate.
     MODEL_CONFIG_CLASS: ClassVar[type[Any] | None] = None
@@ -240,7 +241,8 @@ class DeepSeekV41Bridge(MegatronModelBridge):
 
     @classmethod
     def megatron_to_hf_config(cls, provider: DeepSeekV41ModelProvider) -> dict[str, Any]:
-        """Retain V4.1 identity and source metadata; this is not a standalone checkpoint export."""
+        """Retain V4.1 identity and source metadata; this is not a standalone
+        checkpoint export."""
         config = hf_config_dict(provider.v41_hf_config)
         text = config.get("text_config", config)
         text.update(

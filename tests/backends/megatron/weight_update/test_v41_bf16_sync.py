@@ -3,7 +3,8 @@
 """CPU regression for V4.1's unquantized train/rollout payload contract.
 
 Use real Bridge mappings and conversion, with prebuilt local tasks instead of a
-distributed model. TP/EP gathering and SGLang's GPU expert loader are not covered.
+distributed model. TP/EP gathering and SGLang's GPU expert loader are not
+covered.
 """
 
 from __future__ import annotations
@@ -28,7 +29,8 @@ from relax.models.deepseekv41.bridge import DeepSeekV41Bridge  # noqa: E402
 
 
 def _convert_bf16(megatron_name: str, weight: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Supply an already gathered CPU tensor without mocking conversion or quantization."""
+    """Supply an already gathered CPU tensor without mocking conversion or
+    quantization."""
     mapping = DeepSeekV41Bridge().mapping_registry().megatron_to_hf_lookup(megatron_name)
     assert isinstance(mapping, (ReplicatedMapping, GatedMLPMapping))
     module = torch.nn.Module()
@@ -89,7 +91,8 @@ def test_v41_bf16_sync_expert_gate_up_preserves_full_weights(megatron_expert: st
 
 
 def test_v41_bf16_sync_sglang_engram_loader_preserves_values() -> None:
-    """Exercise the installed SGLang ReplicatedLinear loader, not an emulated copy."""
+    """Exercise the installed SGLang ReplicatedLinear loader, not an emulated
+    copy."""
     linear = pytest.importorskip("sglang.srt.layers.linear")
     weight = _weight()
     converted = _convert_bf16("decoder.layers.1.v41_engram.linear_wkv.weight", weight)

@@ -31,7 +31,8 @@ def _rope_kernel(
 
 
 def row_stride_or_none(x: torch.Tensor):
-    """Row stride of a contiguous tensor or a last-dim slice of one, else None."""
+    """Row stride of a contiguous tensor or a last-dim slice of one, else
+    None."""
     if x.stride(-1) != 1:
         return None
     if x.ndim == 1:
@@ -79,5 +80,6 @@ class _RotaryEmb(torch.autograd.Function):
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-    """In-place RoPE on the last dim of x ([b, s, d] or [b, s, h, d]); `freqs_cis` is complex [s, d/2]."""
+    """In-place RoPE on the last dim of x ([b, s, d] or [b, s, h, d]);
+    `freqs_cis` is complex [s, d/2]."""
     return _RotaryEmb.apply(x, freqs_cis, inverse)

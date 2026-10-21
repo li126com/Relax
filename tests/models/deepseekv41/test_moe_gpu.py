@@ -2,9 +2,10 @@
 
 """Real V4.1 MoE formula, EP and DeepEP checks on two explicitly selected GPUs.
 
-Run with RELAX_TEST_V41_GPU=1 and CUDA_VISIBLE_DEVICES containing two idle GPUs.
-The fixture reduces dimensions while retaining V4.1's frozen sqrtsoftplus router,
-expert correction bias, grouped SwiGLU experts and clamped shared expert.
+Run with RELAX_TEST_V41_GPU=1 and CUDA_VISIBLE_DEVICES containing two idle
+GPUs. The fixture reduces dimensions while retaining V4.1's frozen sqrtsoftplus
+router, expert correction bias, grouped SwiGLU experts and clamped shared
+expert.
 """
 
 import datetime
@@ -82,9 +83,7 @@ def _make_model(ep_size: int, dispatcher: str, recompute: bool, skew: bool) -> t
         recompute_granularity="selective" if recompute else None,
         recompute_modules=["moe"] if recompute else [],
     )
-    model = get_moe_module_spec(num_experts=EXPERTS, moe_grouped_gemm=True)(
-        config=config, layer_number=1
-    ).cuda()
+    model = get_moe_module_spec(num_experts=EXPERTS, moe_grouped_gemm=True)(config=config, layer_number=1).cuda()
     offset = model.local_expert_indices[0]
     with torch.no_grad():
         for name, parameter in model.named_parameters():
@@ -99,7 +98,8 @@ def _make_model(ep_size: int, dispatcher: str, recompute: bool, skew: bool) -> t
 
 
 def _oracle(value: torch.Tensor, weights: dict[str, torch.Tensor], bias: torch.Tensor) -> torch.Tensor:
-    """Independent PyTorch definition with the same BF16 rounding and FP32 router."""
+    """Independent PyTorch definition with the same BF16 rounding and FP32
+    router."""
     flat = value.reshape(-1, HIDDEN)
     scores = F.softplus(F.linear(flat.float(), weights["router.weight"].float())).sqrt()
     indices = torch.topk(scores + bias, TOPK, dim=-1).indices
@@ -244,12 +244,27 @@ def _worker(rank: int, rendezvous: str, output_path: str, skew: bool, recompute:
                     _compare(actual_gradient, alltoall_gradients[name], f"deepep_vs_alltoall/{name}", records, 0.01)
             del model, value
             torch.cuda.synchronize()
-        Path(f"{output_path}.rank{rank}.json").write_text(json.dumps({
-            "seed": SEED, "dtype": "bfloat16", "hidden": HIDDEN, "intermediate": INTERMEDIATE,
-            "tokens": TOKENS, "experts": EXPERTS, "topk": TOPK, "clamp": CLAMP, "scaling": SCALE,
-            "skew": skew, "selective_moe_recompute": recompute, "router_frozen": True,
-            "tokens_per_expert": counts, "checks": records,
-        }, indent=2))
+        Path(f"{output_path}.rank{rank}.json").write_text(
+            json.dumps(
+                {
+                    "seed": SEED,
+                    "dtype": "bfloat16",
+                    "hidden": HIDDEN,
+                    "intermediate": INTERMEDIATE,
+                    "tokens": TOKENS,
+                    "experts": EXPERTS,
+                    "topk": TOPK,
+                    "clamp": CLAMP,
+                    "scaling": SCALE,
+                    "skew": skew,
+                    "selective_moe_recompute": recompute,
+                    "router_frozen": True,
+                    "tokens_per_expert": counts,
+                    "checks": records,
+                },
+                indent=2,
+            )
+        )
     finally:
         torch.cuda.synchronize()
         if buffer is not None:

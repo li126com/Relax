@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Colocated weight-update logging must not free a paused TMS allocator's blocks."""
+"""Colocated weight-update logging must not free a paused TMS allocator's
+blocks."""
 
 import ast
 from pathlib import Path

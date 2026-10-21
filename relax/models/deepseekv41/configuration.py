@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""HF configuration compatibility for the Miles V4.1 text-training architecture."""
+"""HF configuration compatibility for the Miles V4.1 text-training
+architecture."""
 
 from argparse import Namespace
 from copy import deepcopy
@@ -57,7 +58,8 @@ ARCHITECTURE_KEYS = {
 
 
 def hf_config_dict(config: Any) -> dict[str, Any]:
-    """Copy a config without changing the source used by subsequent AutoBridge calls."""
+    """Copy a config without changing the source used by subsequent AutoBridge
+    calls."""
     if isinstance(config, dict):
         return deepcopy(config)
     if hasattr(config, "to_dict"):
@@ -66,7 +68,8 @@ def hf_config_dict(config: Any) -> dict[str, Any]:
 
 
 def normalize_text_config(config: Any) -> dict[str, Any]:
-    """Accept both the original composite checkpoint and Miles' flattened checkpoint."""
+    """Accept both the original composite checkpoint and Miles' flattened
+    checkpoint."""
     original = hf_config_dict(config)
     if original.get("model_type") not in ("deepseek_v41", "deepseek_v41_text"):
         raise ValueError("DeepSeek V4.1 Bridge requires a deepseek_v41 checkpoint configuration.")
@@ -95,12 +98,14 @@ def _init_hf_config(self: Any, text_config: Any = None, **kwargs: Any) -> None:
 
 
 def register_hf_config(*, for_training: bool = False) -> None:
-    """Register configuration-only fallbacks; no HF model implementation is needed.
+    """Register configuration-only fallbacks; no HF model implementation is
+    needed.
 
-    Keep Transformers optional until this model package is imported. Binding the
-    fallback classes at module scope also makes their instances pickleable.
+    Keep Transformers optional until this model package is imported. Binding
+    the fallback classes at module scope also makes their instances pickleable.
     SGLang registers its own flattened config for rollout; only training entry
-    points explicitly restore our composite-aware registration after those imports.
+    points explicitly restore our composite-aware registration after those
+    imports.
     """
     from transformers import AutoConfig, PretrainedConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
@@ -124,7 +129,8 @@ def register_hf_config(*, for_training: bool = False) -> None:
 
 
 def configure_runtime(provider: Any, args: Namespace) -> None:
-    """Keep unsupported auxiliary architectures out of the text-only provider."""
+    """Keep unsupported auxiliary architectures out of the text-only
+    provider."""
     from .execution_config import configure_execution_runtime
 
     if getattr(args, "mtp_num_layers", None):

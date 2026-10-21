@@ -517,8 +517,7 @@ def get_batch(
 
         if allgather_cp:
             tokens = [
-                slice_bshd_contiguous_cp(t, pad_token_id, max_seqlen, cp_size=cp_size, cp_rank=cp_rank)
-                for t in tokens
+                slice_bshd_contiguous_cp(t, pad_token_id, max_seqlen, cp_size=cp_size, cp_rank=cp_rank) for t in tokens
             ]
         else:
             tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Torch 2.13 collective delegation; real smoke tests use an isolated CPU Gloo group."""
+"""Torch 2.13 collective delegation; real smoke tests use an isolated CPU Gloo
+group."""
 
 from __future__ import annotations
 

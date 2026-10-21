@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Validate the execution checkpoint using headers only, without model dependencies."""
+"""Validate the execution checkpoint using headers only, without model
+dependencies."""
 
 import importlib.util
 import json

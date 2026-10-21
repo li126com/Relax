@@ -99,11 +99,13 @@ def _mmap_rows(
     expected_rows: int,
     expected_dtypes: tuple[str, ...],
 ) -> torch.Tensor:
-    """Read-only byte view of a safetensors row shard, without materializing the table.
+    """Read-only byte view of a safetensors row shard, without materializing
+    the table.
 
-    ``torch.from_numpy`` retains the NumPy memmap owner. The mapping remains live
-    while a tensor/view references it and is released when that reference chain
-    dies; no independently closed mmap or permanently open file is retained.
+    ``torch.from_numpy`` retains the NumPy memmap owner. The mapping remains
+    live while a tensor/view references it and is released when that reference
+    chain dies; no independently closed mmap or permanently open file is
+    retained.
     """
     with open(path, "rb") as source:
         file_size = os.fstat(source.fileno()).st_size
@@ -260,7 +262,8 @@ def engram_gate(
 
 
 class DeepSeekV41Engram(MegatronModule):
-    """TP row-sharded frozen tables; only the retrieval projection/gate train."""
+    """TP row-sharded frozen tables; only the retrieval projection/gate
+    train."""
 
     def __init__(
         self,

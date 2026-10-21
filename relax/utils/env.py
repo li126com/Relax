@@ -109,7 +109,8 @@ def configure_fp8_block_scaling() -> None:
     """Resolve the training worker's scale policy before TE imports its recipe.
 
     A CPU driver may see different GPUs from its workers. Ray assignments and
-    torchrun's LOCAL_RANK identify the worker's GPU; explicit settings take priority.
+    torchrun's LOCAL_RANK identify the worker's GPU; explicit settings take
+    priority.
     """
     import ray
 

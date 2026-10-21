@@ -18,7 +18,8 @@ import torch.nn.functional as F
 
 @dataclass(slots=True)
 class V41Runtime:
-    """One model instance's current microbatch state, never stored on a shared config."""
+    """One model instance's current microbatch state, never stored on a shared
+    config."""
 
     pre: torch.Tensor | None = None
     input_ids: torch.Tensor | None = None
@@ -37,7 +38,8 @@ class V41Runtime:
 
 
 def v41_aggregate(hidden: torch.Tensor, pre: torch.Tensor | None, n: int) -> torch.Tensor:
-    """Consume the previous sublayer's pre coefficients, as required by V4.1 single-pass mHC."""
+    """Consume the previous sublayer's pre coefficients, as required by V4.1
+    single-pass mHC."""
     s, b, width = hidden.shape
     streams = hidden.view(s, b, n, width // n)
     if pre is None:
@@ -46,7 +48,8 @@ def v41_aggregate(hidden: torch.Tensor, pre: torch.Tensor | None, n: int) -> tor
 
 
 def v41_pack_pre(pre: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Carry FP32 pre coefficients through BF16 tensors using differentiable high/low parts."""
+    """Carry FP32 pre coefficients through BF16 tensors using differentiable
+    high/low parts."""
     high = pre.to(dtype)
     low = (pre.float() - high.float()).to(dtype)
     return torch.cat((high, low), dim=-1)
@@ -81,7 +84,8 @@ class _CarrySection:
 
 @dataclass(frozen=True, slots=True, init=False)
 class V41CarryPlan:
-    """Static carry layout immediately after a global decoder layer (zero-based)."""
+    """Static carry layout immediately after a global decoder layer (zero-
+    based)."""
 
     pre: bool
     input_ids: bool

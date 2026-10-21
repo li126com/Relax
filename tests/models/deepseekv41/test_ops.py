@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU contracts for the V4.1 ops; GPU kernels are explicitly replaced by stubs."""
+"""CPU contracts for the V4.1 ops; GPU kernels are explicitly replaced by
+stubs."""
 
 import importlib
 import math

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""The BF16 train/rollout checkpoint contract; frozen Engram tables stay quantized."""
+"""The BF16 train/rollout checkpoint contract; frozen Engram tables stay
+quantized."""
 
 import json
 import struct
@@ -28,12 +29,14 @@ def _read_header(path: Path) -> dict[str, Any]:
 
 
 def validate_bf16_checkpoint(checkpoint: str | None, *, require_v41: bool = False) -> bool:
-    """Check config and tensor headers without loading weights, importing Torch, or rewriting files.
+    """Check config and tensor headers without loading weights, importing
+    Torch, or rewriting files.
 
     Non-V4.1 checkpoints are untouched. Known V4.1 callers require a local
-    safetensors directory, as the training Engram loader also needs local files.
-    Configuration-only Bridge inspection can still use the original checkpoint;
-    this check belongs at execution and online synchronization entry points.
+    safetensors directory, as the training Engram loader also needs local
+    files. Configuration-only Bridge inspection can still use the original
+    checkpoint; this check belongs at execution and online synchronization
+    entry points.
     """
     root = Path(checkpoint) if checkpoint else None
     config_path = root / "config.json" if root is not None else None

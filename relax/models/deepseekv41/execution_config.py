@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Execution limits of the Miles-compatible V4.1 text model, not HF architecture overrides."""
+"""Execution limits of the Miles-compatible V4.1 text model, not HF
+architecture overrides."""
 
 from argparse import Namespace
 from typing import Any
@@ -56,11 +57,12 @@ def _validate_runtime_layout(provider: Any) -> None:
 
 
 def configure_execution_runtime(provider: Any, args: Namespace) -> None:
-    """Carry the existing runtime options into the model without adding CLI arguments.
+    """Carry the existing runtime options into the model without adding CLI
+    arguments.
 
-    Kernel dimensions and the final dtype are checked at model construction, after
-    Relax's generic provider overrides. Configuration-only Bridge conversion remains
-    usable for differently sized checkpoint fixtures.
+    Kernel dimensions and the final dtype are checked at model construction,
+    after Relax's generic provider overrides. Configuration-only Bridge
+    conversion remains usable for differently sized checkpoint fixtures.
     """
     for source, target, default in (
         ("hf_checkpoint", "v41_hf_checkpoint", None),
@@ -79,7 +81,8 @@ def configure_execution_runtime(provider: Any, args: Namespace) -> None:
 
 
 def validate_execution_config(provider: Any) -> None:
-    """Reject unsupported execution paths before allocating model weights or launching kernels."""
+    """Reject unsupported execution paths before allocating model weights or
+    launching kernels."""
     _validate_runtime_layout(provider)
     dtype = str(provider.params_dtype).removeprefix("torch.")
     if dtype != "bfloat16" or getattr(provider, "fp8", None) or getattr(provider, "fp4", None):

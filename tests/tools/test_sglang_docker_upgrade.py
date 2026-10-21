@@ -45,7 +45,8 @@ def test_sglang_dockerfile_targets_official_cuda13_hopper_and_blackwell():
 
 @pytest.mark.parametrize("build_gpu", [(9, 0), (10, 3)])
 def test_int4_explicit_build_targets_override_visible_gpu(monkeypatch, build_gpu):
-    """Exercise setup.py with stubs; never import Torch or compile an extension."""
+    """Exercise setup.py with stubs; never import Torch or compile an
+    extension."""
     captured = {}
     torch = ModuleType("torch")
     torch.cuda = SimpleNamespace(

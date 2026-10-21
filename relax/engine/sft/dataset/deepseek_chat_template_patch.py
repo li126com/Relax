@@ -242,9 +242,7 @@ def try_patch_deepseek_chat_template(
         # <think> blocks, without applying V4's scaffold string replacements.
         if suppress_indices:
             thinking_mode = resolved_kwargs.get("thinking_mode")
-            if thinking_mode == "chat" or (
-                thinking_mode is None and resolved_kwargs.get("enable_thinking") is False
-            ):
+            if thinking_mode == "chat" or (thinking_mode is None and resolved_kwargs.get("enable_thinking") is False):
                 raise ValueError("DeepSeek V4.1 SFT reasoning requires thinking_mode='thinking'.")
             resolved_kwargs[_EMBEDDED_THINK_INDICES_KEY] = suppress_indices
         if resolved_kwargs.get("preserve_thinking") is not None:

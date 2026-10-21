@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+
 torch = pytest.importorskip("torch")
 pytest.importorskip("megatron.core")
 
@@ -31,6 +32,7 @@ from transformers import PreTrainedTokenizerFast  # noqa: E402
 from relax.models.deepseekv41.engram import DeepSeekV41Engram, engram_gate  # noqa: E402
 from relax.models.deepseekv41.model import V41HyperConnection  # noqa: E402
 from relax.models.deepseekv41.runtime import V41Runtime  # noqa: E402
+
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires the remote training GPU image")
 
@@ -116,8 +118,11 @@ def test_mhc_gpu_previous_pre_sinkhorn_and_gradients(dtype: torch.dtype, scale: 
     for index, (result, reference) in enumerate(zip(actual_grad, expected_grad)):
         tolerance = 0.02 if dtype == torch.bfloat16 and index == 0 else 5e-4
         _close(
-            result, reference, f"mhc/{dtype}/{scale}/grad{index}",
-            atol=tolerance, rtol=0.015 if dtype == torch.bfloat16 else 3e-4,
+            result,
+            reference,
+            f"mhc/{dtype}/{scale}/grad{index}",
+            atol=tolerance,
+            rtol=0.015 if dtype == torch.bfloat16 else 3e-4,
         )
     runtime.pre = None
     _close(module(hidden.detach())[0], hidden.detach()[..., :32], "mhc/initial_stream", atol=0, rtol=0)
@@ -126,8 +131,10 @@ def test_mhc_gpu_previous_pre_sinkhorn_and_gradients(dtype: torch.dtype, scale: 
     mixed = module.fused_h_res_h_post_bda(mixing, hidden, post, (output, None), 0, True, False)
     streams = hidden.float().view(7, 2, 4, 32)
     reference = (
-        torch.matmul(mixing.transpose(-1, -2), streams) + post.unsqueeze(-1) * output.float().unsqueeze(-2)
-    ).flatten(-2).to(dtype)
+        (torch.matmul(mixing.transpose(-1, -2), streams) + post.unsqueeze(-1) * output.float().unsqueeze(-2))
+        .flatten(-2)
+        .to(dtype)
+    )
     _close(mixed, reference, "mhc/residual_orientation", atol=0, rtol=0)
     mix_inputs = (hidden, mixing, post, output)
     cotangent = torch.randn_like(mixed)
@@ -163,7 +170,9 @@ def test_engram_gpu_gate_formula_and_checkpoint(dtype: torch.dtype) -> None:
         _close(result, reference, f"engram/gate/{dtype}/chunk{chunk}", atol=2e-6, rtol=2e-5)
         for index, (actual, expected) in enumerate(zip(torch.autograd.grad(result, inputs, cotangent), expected_grad)):
             _close(
-                actual, expected, f"engram/gate/{dtype}/chunk{chunk}/grad{index}",
+                actual,
+                expected,
+                f"engram/gate/{dtype}/chunk{chunk}/grad{index}",
                 atol=0.004 if dtype == torch.bfloat16 else 2e-5,
                 rtol=0.02 if dtype == torch.bfloat16 else 1e-4,
             )
@@ -213,14 +222,28 @@ def _decoded_table(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 
 def _engram_config(path: Path, tp: int, cp: int) -> TransformerConfig:
     config = TransformerConfig(
-        num_layers=1, hidden_size=32, num_attention_heads=2, bf16=True, params_dtype=torch.bfloat16,
-        tensor_model_parallel_size=tp, context_parallel_size=cp, sequence_parallel=tp > 1,
-        gradient_accumulation_fusion=False, hidden_dropout=0, attention_dropout=0,
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=2,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        tensor_model_parallel_size=tp,
+        context_parallel_size=cp,
+        sequence_parallel=tp > 1,
+        gradient_accumulation_fusion=False,
+        hidden_dropout=0,
+        attention_dropout=0,
     )
     for name, value in dict(
-        num_residual_streams=4, v41_hf_checkpoint=str(path), v41_engram_layer_ids=(0,),
-        v41_engram_num_embeddings=(36,), v41_engram_max_ngram_size=3, v41_engram_vocab_size=5,
-        v41_engram_compressed_vocab_size=8, v41_engram_n_heads=2, v41_engram_head_dim=32,
+        num_residual_streams=4,
+        v41_hf_checkpoint=str(path),
+        v41_engram_layer_ids=(0,),
+        v41_engram_num_embeddings=(36,),
+        v41_engram_max_ngram_size=3,
+        v41_engram_vocab_size=5,
+        v41_engram_compressed_vocab_size=8,
+        v41_engram_n_heads=2,
+        v41_engram_head_dim=32,
         v41_engram_pad_token_id=1,
     ).items():
         setattr(config, name, value)
@@ -271,8 +294,11 @@ def test_engram_gpu_mmap_distributed_forward_and_gradients(process_group: None, 
             if mode == "cp":
                 torch.distributed.all_reduce(result, group=parallel_state.get_context_parallel_group())
             _close(
-                result, reference, f"engram/{mode}/param_grad{index}",
-                atol=0.15 if result.dtype == torch.bfloat16 else 0.02, rtol=0.02,
+                result,
+                reference,
+                f"engram/{mode}/param_grad{index}",
+                atol=0.15 if result.dtype == torch.bfloat16 else 0.02,
+                rtol=0.02,
             )
         assert module.table.device.type == "cpu" and module.table_scale.device.type == "cpu"
         assert module.table.shape[0] == (18 if tp == 2 else 36)

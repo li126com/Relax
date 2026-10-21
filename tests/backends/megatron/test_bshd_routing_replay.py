@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Real CPU route packing without importing the Ray actor or initializing process groups."""
+"""Real CPU route packing without importing the Ray actor or initializing
+process groups."""
 
 from __future__ import annotations
 
@@ -70,7 +71,8 @@ def _samples(batch_size: int, shift: int = 0) -> tuple[list[Any], list[Any]]:
 
 
 def _expected_layout(routes: list[Any], cp_size: int, cp_rank: int, allgather_cp: bool) -> Any:
-    """Independent index construction: sequence-major/batch-minor, not sample concatenation."""
+    """Independent index construction: sequence-major/batch-minor, not sample
+    concatenation."""
     if allgather_cp or cp_size == 1:
         local_length = _PADDED_LENGTH // cp_size
         indices = torch.arange(cp_rank * local_length, (cp_rank + 1) * local_length)

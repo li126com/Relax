@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Independently compare pre-update train/rollout LPs from existing ONLINE dumps.
+"""Independently compare pre-update train/rollout LPs from existing ONLINE
+dumps.
 
 Init hook: scripts.tools.deepseek_v41_logprob_compare.initialize_reduced_experiment
 CLI: python -m scripts.tools.deepseek_v41_logprob_compare --dump-details DIR
@@ -26,7 +27,8 @@ logger = get_logger(__name__)
 
 
 def initialize_reduced_experiment(args: argparse.Namespace) -> None:
-    """Apply the reduced experiment's DeepEP setting before recording metadata."""
+    """Apply the reduced experiment's DeepEP setting before recording
+    metadata."""
     import torch
 
     if args.deterministic_mode:
@@ -35,7 +37,8 @@ def initialize_reduced_experiment(args: argparse.Namespace) -> None:
 
 
 def capture_parallel_metadata(args: argparse.Namespace) -> None:
-    """Existing Megatron init hook; records facts only, without changing execution."""
+    """Existing Megatron init hook; records facts only, without changing
+    execution."""
     import torch
     import torch.distributed as dist
     from megatron.core import mpu
@@ -89,7 +92,8 @@ def capture_parallel_metadata(args: argparse.Namespace) -> None:
 
 
 def _native_cpu_helpers(torch: Any) -> dict[str, Any]:
-    """Execute unchanged CPU helpers without importing backend initialization patches."""
+    """Execute unchanged CPU helpers without importing backend initialization
+    patches."""
     source = Path(__file__).resolve().parents[2] / "relax/backends/megatron/cp_utils.py"
     names = {
         "get_logits_and_tokens_offset_with_cp",

@@ -277,9 +277,12 @@ def _sparse_attention_bwd_kernel(
 
 
 def sparse_attention_bwd(q, kv, o, do, indices, kv_indices, lse, d_v, *, sm_scale, num_stages, split_store):
-    """Shapes as in sparse_attention_fwd, plus o/do [B, S, H, d_v] and lse [B, S, H].
-    Returns dq [B, S, H, d_v + d_tail] bf16, dkv [B, S_kv, G, d_v + d_tail] bf16 and delta [B, S, H] fp32
-    (rowsum(o * do), which the caller needs for the attention-sink gradient)."""
+    """Shapes as in sparse_attention_fwd, plus o/do [B, S, H, d_v] and lse [B,
+    S, H]. Returns dq [B, S, H, d_v + d_tail] bf16, dkv [B, S_kv, G, d_v +
+    d_tail] bf16 and delta [B, S, H] fp32.
+
+    (rowsum(o * do), which the caller needs for the attention-sink gradient).
+    """
     assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous() and lse.is_contiguous()
     B, S, H, dim_plus_tail_dim = q.shape
     _, S_kv, kv_group, _ = kv.shape

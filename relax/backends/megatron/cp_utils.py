@@ -468,7 +468,8 @@ def slice_bshd_contiguous_cp(
     cp_size: int,
     cp_rank: int,
 ) -> torch.Tensor:
-    """Pad one BSHD sample and select its contiguous CP slice without global process-group state."""
+    """Pad one BSHD sample and select its contiguous CP slice without global
+    process-group state."""
     if cp_size < 1 or not 0 <= cp_rank < cp_size:
         raise ValueError(f"Invalid contiguous CP rank/size: {cp_rank}/{cp_size}.")
     if max_seq_len < tensor.size(0) or max_seq_len % cp_size:

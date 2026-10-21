@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU-only BSHD contiguous-CP layout, target alignment, and gradient regression tests."""
+"""CPU-only BSHD contiguous-CP layout, target alignment, and gradient
+regression tests."""
 
 from __future__ import annotations
 

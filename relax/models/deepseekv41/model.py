@@ -126,7 +126,8 @@ class V41TransformerLayer(HyperConnectionTransformerLayer):
 
 
 class V41TransformerBlock(TransformerBlock):
-    """Use Core's layer schedule/offloading, but not V4's learned output contraction."""
+    """Use Core's layer schedule/offloading, but not V4's learned output
+    contraction."""
 
     def __init__(self, config: TransformerConfig, spec: TransformerBlockSubmodules, **kwargs: Any) -> None:
         if not spec.layer_specs:
@@ -194,7 +195,8 @@ def get_v41_spec(
 
 
 def _freeze_routers(model: GPTModel) -> None:
-    """Match Miles' frozen routing policy without disabling gradients through routing inputs."""
+    """Match Miles' frozen routing policy without disabling gradients through
+    routing inputs."""
     for layer in model.decoder.layers:
         router = getattr(layer.mlp, "router", None)
         if router is not None:
@@ -251,7 +253,8 @@ class DeepSeekV41GPTModel(GPTModel):
         return V41TransformerBlock
 
     def _release_transient_state(self, *, for_offload: bool = True) -> None:
-        """Drop microbatch activation references, retaining frozen host-backed Engram tables."""
+        """Drop microbatch activation references, retaining frozen host-backed
+        Engram tables."""
         self.v41_runtime.reset()
         if for_offload:
             from .ops.position import precompute_freqs_cis

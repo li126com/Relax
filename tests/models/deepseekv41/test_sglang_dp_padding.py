@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Exercise the real SGLang V4.1 source entry without allocating model weights."""
+"""Exercise the real SGLang V4.1 source entry without allocating model
+weights."""
 
 import subprocess
 import sys

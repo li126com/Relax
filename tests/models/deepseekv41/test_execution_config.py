@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Dependency-free execution boundary tests; no model construction or CUDA initialization."""
+"""Dependency-free execution boundary tests; no model construction or CUDA
+initialization."""
 
 import importlib.util
 from pathlib import Path
