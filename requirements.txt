@@ -24,7 +24,7 @@ tensorboard
 wandb
 debugpy==1.8.0
 math_verify==0.8.0
-librosa
+librosa==0.11.0
 diffusers>=0.37.0
 imageio[ffmpeg]
 # Upper-bounded on purpose: relax/backends/fsdp/lora.py imports

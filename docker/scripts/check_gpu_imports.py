@@ -1,9 +1,79 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Check GPU imports, optionally running small operators on the current GPU."""
 
+import os
 import sys
 from argparse import ArgumentParser
 from importlib import import_module
+from unittest.mock import patch
+
+
+def check_te_attention() -> None:
+    """Check the training FlashAttention path for Qwen3.5 vision and text."""
+    import torch
+    import torch.nn.functional as F
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    from transformer_engine.pytorch import DotProductAttention
+
+    torch.manual_seed(42)
+    lengths = (65, 127)
+    total = sum(lengths)
+    cu_seqlens = torch.tensor([0, lengths[0], total], device="cuda", dtype=torch.int32)
+    # Keep NVTE_FLASH_ATTN_V4 from the image; select FlashAttention as training does.
+    with patch.dict(os.environ, NVTE_FLASH_ATTN="1", NVTE_FUSED_ATTN="0", NVTE_UNFUSED_ATTN="0"):
+        for head_dim, heads, kv_heads, causal in ((72, 16, 16, False), (256, 8, 1, True)):
+            q, k, v = [
+                (torch.randn(total, n, head_dim, device="cuda", dtype=torch.bfloat16) * 0.25).requires_grad_()
+                for n in (heads, kv_heads, kv_heads)
+            ]
+            reference_qkv = [x.detach().float().requires_grad_() for x in (q, k, v)]
+            reference_parts = []
+            with sdpa_kernel(SDPBackend.MATH):
+                for start, length in ((0, lengths[0]), (lengths[0], lengths[1])):
+                    rq, rk, rv = [
+                        x[start : start + length].repeat_interleave(heads // x.shape[1], dim=1).transpose(0, 1)
+                        for x in reference_qkv
+                    ]
+                    reference_parts.append(
+                        F.scaled_dot_product_attention(rq, rk, rv, is_causal=causal).transpose(0, 1)
+                    )
+            reference = torch.cat(reference_parts)
+            attention = DotProductAttention(
+                heads,
+                head_dim,
+                num_gqa_groups=kv_heads,
+                attention_dropout=0,
+                qkv_format="thd",
+                attn_mask_type="padding_causal" if causal else "padding",
+                layer_number=1,
+            )
+            output = attention(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=max(lengths),
+                max_seqlen_kv=max(lengths),
+                pad_between_seqs=False,
+            ).view(total, heads, head_dim)
+            grad = torch.randn_like(output) * 0.25
+            output.backward(grad)
+            reference.backward(grad.float())
+            errors = []
+            for actual, expected in zip(
+                (output, q.grad, k.grad, v.grad),
+                (reference, *(x.grad for x in reference_qkv)),
+                strict=True,
+            ):
+                error = (
+                    torch.linalg.vector_norm(actual.float() - expected) / torch.linalg.vector_norm(expected)
+                ).item()
+                assert error < 0.02, (head_dim, error)
+                errors.append(error)
+            sys.stdout.write(
+                f"TE FlashAttention head_dim={head_dim} forward/backward OK: max relative L2={max(errors):.4%}\n"
+            )
 
 
 def check_operators() -> None:
@@ -76,9 +146,11 @@ def main() -> None:
     args = parser.parse_args()
     assert torch.cuda.is_available(), "GPU/driver unavailable"
     import_module("transformer_engine.pytorch")
+    assert torch.backends.cudnn.version() is not None, "cuDNN unavailable"
     import_module("sgl_kernel")
     sys.stdout.write(f"GPU imports OK: {torch.cuda.get_device_name()} {torch.cuda.get_device_capability()}\n")
     if args.operators:
+        check_te_attention()
         check_operators()
 
 

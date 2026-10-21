@@ -62,7 +62,7 @@ RUN FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE MAX_JOBS=64 \
         'flash_mla built but flash_mla_sparse_fwd missing'" && \
     rm -rf /opt/FlashMLA
 
-# FA3 stays Hopper-only; TE selects FA2/cuDNN on Blackwell automatically.
+# FA3 stays Hopper-only; Blackwell uses FA2/cuDNN with TE's FA4 disabled below.
 # TE 2.18 imports flash_attn_interface; existing callers use flash_attn_3.
 # Alias both names to one module so its Torch custom ops are registered once.
 # Keep flash_attn_config.py, which the interface imports during forward.
@@ -98,6 +98,9 @@ RUN NVTE_PYTORCH_FORCE_BUILD=TRUE MAX_JOBS=32 \
 COPY docker/patch/transformer_engine/2.18.0-fa2-sm103.patch /tmp/te-fa2-sm103.patch
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/te-fa2-sm103.patch
+
+# FA4 b19 fails Qwen3.5 vision backward; b35 still fails TE's causal head256 backward.
+ENV NVTE_FLASH_ATTN_V4=0
 
 WORKDIR /root
 
@@ -219,6 +222,11 @@ RUN pip install --no-cache-dir packaging==25.0 protobuf==6.33.6 grpcio-tools==1.
 
 # Restore the official DeepEP runtime after Torch's NCCL dependency resolution.
 RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7
+
+# Keep Torch's pip cuDNN; mixing it with the base image's apt cuDNN breaks TE imports.
+RUN apt-get remove -y --purge --allow-change-held-packages \
+        libcudnn9-cuda-13 libcudnn9-dev-cuda-13 libcudnn9-headers-cuda-13 && \
+    rm -rf /var/lib/apt/lists/*
 
 # TE can load NCCL before Torch; prefer the restored wheel over the system library.
 ENV LD_LIBRARY_PATH=/opt/sglang/lib/python${PYVER}/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH}
