@@ -292,9 +292,7 @@ def _cp_worker() -> None:
                 candidate.zero_grad(set_to_none=True)
                 local = source.chunk(2)[rank].detach().clone().requires_grad_()
                 if recompute:
-                    actual = checkpoint(
-                        lambda value: forward(candidate, candidate_runtime, value), local, use_reentrant=True
-                    )
+                    actual = checkpoint(forward, candidate, candidate_runtime, local, use_reentrant=True)
                 else:
                     actual = forward(candidate, candidate_runtime, local)
                 actual.backward(upstream.chunk(2)[rank].contiguous())

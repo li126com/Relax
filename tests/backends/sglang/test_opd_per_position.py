@@ -19,12 +19,14 @@ functions = extract_functions(
     target,
     {"get_token_ids_logprobs_raw", "get_token_ids_logprobs_chunk", "get_token_ids_logprobs_batch_optimized"},
 )
-stage = next(
-    node for node in ast.parse(source).body if isinstance(node, ast.ClassDef) and node.name == "LogprobStage"
-)
+stage = next(node for node in ast.parse(source).body if isinstance(node, ast.ClassDef) and node.name == "LogprobStage")
 logprob = ModuleType("patched_logprob_processor")
 logprob.__dict__.update(
-    torch=torch, Enum=Enum, auto=auto, is_pin_memory_available=lambda device: False, async_d2h=lambda value: value.cpu()
+    torch=torch,
+    Enum=Enum,
+    auto=auto,
+    is_pin_memory_available=lambda device: False,
+    async_d2h=lambda value: value.cpu(),
 )
 exec(compile(ast.Module(body=[stage, *functions], type_ignores=[]), target, "exec"), logprob.__dict__)
 
