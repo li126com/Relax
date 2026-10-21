@@ -87,26 +87,33 @@ def _blob_hash(source: str) -> str:
     return hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
 
 
-def _validated_source(source: str, patch: str, target: str) -> str:
+def _validated_source(source: str, patch: str, target: str, extra_patches: tuple[str, ...] = ()) -> str:
+    patches = (patch, *extra_patches)
     match = re.search(r"^index ([0-9a-f]+)\.\.", _section(patch, target), re.MULTILINE)
     if match is None:
         raise AssertionError(f"Missing original blob hash for {target}")
     original_hash = match[1]
     if _blob_hash(source).startswith(original_hash):
-        return apply_file_patch(source, patch, target)
+        for current in patches:
+            source = apply_file_patch(source, current, target)
+        return source
     # Verify already patched files against the current hunks, even if someone
     # edited the patch without refreshing its new-side index hash.
-    original = apply_file_patch(source, patch, target, reverse=True)
+    original = source
+    for current in reversed(patches):
+        original = apply_file_patch(original, current, target, reverse=True)
     if not _blob_hash(original).startswith(original_hash):
         raise AssertionError(f"Source does not match the target SGLang blob for {target}")
-    result = apply_file_patch(original, patch, target)
+    result = original
+    for current in patches:
+        result = apply_file_patch(result, current, target)
     if result != source:
         raise AssertionError(f"Patched source does not round-trip for {target}")
     return result
 
 
 @lru_cache(maxsize=None)
-def patched_source(target: str) -> str:
+def patched_source(target: str, *, include_per_position: bool = False) -> str:
     explicit = os.environ.get("SGLANG_SOURCE_DIR")
     if explicit:
         root = Path(explicit).expanduser()
@@ -123,7 +130,12 @@ def patched_source(target: str) -> str:
     source_path = package / target.removeprefix("python/sglang/")
     try:
         source = source_path.read_bytes().decode("utf-8")
-        return _validated_source(source, PATCH_PATH.read_text(), target)
+        patches = [PATCH_PATH.read_text()]
+        if include_per_position:
+            patches.append((PATCH_PATH.parent.parent / "latest/sglang_per_pos_topk.patch").read_text())
+            header = f"diff --git a/{target} b/{target}\n"
+            patches = [patch for patch in patches if header in patch]
+        return _validated_source(source, patches[0], target, tuple(patches[1:]))
     except (OSError, AssertionError) as error:
         message = f"Target SGLang source validation failed at {source_path}: {error}"
         if explicit:

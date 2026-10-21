@@ -968,7 +968,7 @@ index 0f0edd888b7073fa49c4c77c4a1adfd70e583950..f1c34629114143780cee6372dc25dc91
                                  bootstrap_room=kv_chunk.room,
                                  failure_reason=(
 diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
-index b72dc2a296228e644492098a5efc290f2c156744..758bec641f4c743c1c27560d9908238a12fdfc43 100644
+index b72dc2a296228e644492098a5efc290f2c156744..3ba5a324572494a3ee909cb476236ac0a54a7599 100644
 --- a/python/sglang/srt/disaggregation/prefill.py
 +++ b/python/sglang/srt/disaggregation/prefill.py
 @@ -21,6 +21,8 @@
@@ -980,47 +980,70 @@ index b72dc2a296228e644492098a5efc290f2c156744..758bec641f4c743c1c27560d9908238a
  from array import array
  from collections import deque
  from http import HTTPStatus
-@@ -495,6 +497,11 @@
-                 self.scheduler.attn_tp_cpu_group,
-             )
+@@ -153,6 +155,28 @@
+         req.metadata_buffer_index = -1
+ 
+ 
++class _BootstrapDeadlinePoller:
++    """Include local bootstrap timeouts in the existing rank failure consensus."""
++
++    def __init__(self, req: Req, now: float, timeout: float):
++        self.req = req
++        self.now = now
++        self.timeout = timeout
++
++    def poll(self) -> KVPoll:
++        status = self.req.disagg_kv_sender.poll()
++        entry = self.req.time_stats.prefill_bootstrap_queue_entry_time
++        if (
++            status == KVPoll.Bootstrapping
++            and entry > 0
++            and self.now - entry > self.timeout
++        ):
++            # Failed is reduced with MIN across the existing CP/TP groups.
++            # All ranks must remove the same requests from their queues.
++            return KVPoll.Failed
++        return status
++
++
+ class PrefillBootstrapQueue:
+     """
+     Store the requests in bootstrapping
+@@ -471,6 +495,15 @@
+             else:
+                 return [], []
  
 +        bootstrap_timeout = float(
 +            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
 +        )
 +        now = time.perf_counter()
 +
-         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-             if poll is None:
-                 continue
-@@ -504,6 +511,27 @@
-                 indices_to_remove.add(i)
-                 failed_reqs.append(req)
-             elif poll == KVPoll.Bootstrapping:
-+                entry_time = req.time_stats.prefill_bootstrap_queue_entry_time
-+                if entry_time > 0 and now - entry_time > bootstrap_timeout:
-+                    error_message = (
-+                        f"Prefill bootstrap timed out after {now - entry_time:.1f}s "
-+                        f"for request rank={self.tp_rank} "
-+                        f"{req.rid=} {req.bootstrap_room=}"
-+                    )
-+                    logger.error(error_message)
-+                    prepare_abort(
-+                        req,
-+                        error_message,
-+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
-+                    )
-+                    self.scheduler.output_streamer.stream_output(
-+                        [req], req.return_logprob
-+                    )
-+                    indices_to_remove.add(i)
-+                    failed_reqs.append(req)
-+                    if self.scheduler.metrics_reporter.enable_metrics:
-+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-+                    continue
-                 if (
-                     req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
-                     and not req.is_retracted  # engine paused
-@@ -1020,6 +1048,11 @@
++        deadline_pollers = [
++            _BootstrapDeadlinePoller(req, now, bootstrap_timeout) for req in self.queue
++        ]
++
+         if self.pp_size > 1:
+             polls = poll_and_all_reduce_pp(
+                 (req.rid for req in self.queue),
+@@ -481,7 +514,7 @@
+             uncovered = [i for i, poll in enumerate(polls) if poll is None]
+             if uncovered:
+                 local_polls = poll_and_all_reduce_attn_cp_tp_group(
+-                    [self.queue[i].disagg_kv_sender for i in uncovered],
++                    [deadline_pollers[i] for i in uncovered],
+                     self.scheduler.attn_cp_cpu_group,
+                     self.scheduler.attn_tp_cpu_group,
+                 )
+@@ -490,7 +523,7 @@
+                         polls[i] = KVPoll.Failed
+         else:
+             polls = poll_and_all_reduce_attn_cp_tp_group(
+-                [req.disagg_kv_sender for req in self.queue],
++                deadline_pollers,
+                 self.scheduler.attn_cp_cpu_group,
+                 self.scheduler.attn_tp_cpu_group,
+             )
+@@ -1020,6 +1053,11 @@
              self.attn_tp_cpu_group,
          )
  
@@ -1032,7 +1055,7 @@ index b72dc2a296228e644492098a5efc290f2c156744..758bec641f4c743c1c27560d9908238a
          undone_reqs: List[Req] = []
          # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
          for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-@@ -1054,7 +1087,26 @@
+@@ -1054,7 +1092,26 @@
  
              if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                  # todo: set Transferring correctly in backend
@@ -1662,10 +1685,19 @@ index 9629b7aab6219c21f330937a1657f836e675ee9d..a96170262755b7573c3bd95769ac40c3
  
  class BlockReqType(Enum):
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 52c72a0e24b2658576e3a3cb786ec1d52a4a55c7..fd76683a49b39f261b5ecc8d205e64c7f174ee6d 100755
+index 52c72a0e24b2658576e3a3cb786ec1d52a4a55c7..44be0402d980e4684bee365ce4a375832bf7c5b5 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -1342,6 +1342,7 @@
+@@ -1218,6 +1218,8 @@
+         # would make it stale); the only allocation-time reader is the
+         # ChunkCache fallback, which has no tree nodes and no rebind.
+         self.kv_rotation_base: Optional[int] = None
++        # Protected chunked checkpoint whose write-through hit is deferred.
++        self._hicache_deferred_chunked_backup: Optional[tuple[int, int, int]] = None
+ 
+         # Whether or not if it is chunked. It increments whenever
+         # it is chunked, and decrement whenever chunked request is
+@@ -1342,6 +1344,7 @@
          self.metrics_collector = metrics_collector
          if time_stats is not None:
              self.time_stats = SchedulerReqTimeStats.new_from_obj(time_stats)
@@ -1673,7 +1705,15 @@ index 52c72a0e24b2658576e3a3cb786ec1d52a4a55c7..fd76683a49b39f261b5ecc8d205e64c7
          else:
              self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
          self.time_stats.set_metrics_collector(metrics_collector)
-@@ -3302,11 +3303,14 @@
+@@ -1968,6 +1971,7 @@
+         self.indexer_topk = None
+         self.last_node = None
+         self.kv.cache_protected_len = 0
++        self._hicache_deferred_chunked_backup = None
+         self.kv_rotation_base = None
+         self.num_matched_prefix_tokens = 0
+         self.lock_receipt = DecLockRefParams()
+@@ -3302,11 +3306,14 @@
          retracted_reqs = []
          reqs_to_abort: List[Req] = []
          first_iter = True
@@ -1690,7 +1730,7 @@ index 52c72a0e24b2658576e3a3cb786ec1d52a4a55c7..fd76683a49b39f261b5ecc8d205e64c7
                  break
  
              first_iter = False
-@@ -3351,7 +3355,7 @@
+@@ -3351,7 +3358,7 @@
                      "retract_decode: aborted request %s: %s", req.rid, message
                  )
  
@@ -1700,7 +1740,7 @@ index 52c72a0e24b2658576e3a3cb786ec1d52a4a55c7..fd76683a49b39f261b5ecc8d205e64c7
          ):
              # Even the last remaining request cannot fit in memory.
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index a7d8baeecc37b09a6d09ffb0493526b993f3ac43..bf24c759620fa93c38e325434b14d88b443a0313 100644
+index a7d8baeecc37b09a6d09ffb0493526b993f3ac43..3ebdc74ae62c3d793a6f45b52287fe38cc673b36 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -74,6 +74,7 @@
@@ -1731,7 +1771,17 @@ index a7d8baeecc37b09a6d09ffb0493526b993f3ac43..bf24c759620fa93c38e325434b14d88b
                  (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                  (PauseGenerationReqInput, self.pause_generation),
                  (ContinueGenerationReqInput, self.continue_generation),
-@@ -5186,6 +5193,14 @@
+@@ -5003,6 +5010,9 @@
+         self.metrics_reporter.record_scheduler_idle()
+ 
+     def _record_scheduler_state_for_paused_engine(self) -> None:
++        # Pause stops generation, but in-flight GPU/CPU DMA must complete.
++        if self.enable_hierarchical_cache:
++            self.tree_cache.check_hicache_events()
+         if self.is_fully_idle():
+             self.metrics_reporter.record_scheduler_idle()
+         else:
+@@ -5186,6 +5196,14 @@
  
      def flush_cache(self, empty_cache: bool = True):
          """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
@@ -1746,7 +1796,7 @@ index a7d8baeecc37b09a6d09ffb0493526b993f3ac43..bf24c759620fa93c38e325434b14d88b
          if self.is_fully_idle(ignore_waiting=self._engine_paused):
              self.cur_batch_for_debug = None
              self.last_batch = None
-@@ -5575,6 +5590,10 @@
+@@ -5575,6 +5593,10 @@
                  # The request will still run one decode forward pass.
                  # Then we reuse all existing code to clean up the KV cache allocation.
                  logger.debug(f"Abort running request. {req.rid=}")
@@ -1757,7 +1807,7 @@ index a7d8baeecc37b09a6d09ffb0493526b993f3ac43..bf24c759620fa93c38e325434b14d88b
                  if recv_req.abort_message:
                      # Timeout aborts carry an SLA message + 503 for the client.
                      req.to_finish = FINISH_ABORT(
-@@ -5794,6 +5813,14 @@
+@@ -5794,6 +5816,14 @@
          """In-place loading a new lora adapter from serialized tensors."""
  
          result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
@@ -3705,3 +3755,167 @@ index 788ac19b8cde3f6ae7732949cfb95073384f74fe..32ef3cd0d1b905d64e97f2d63f00a536
  
  
  class LayeredModelLoader(DefaultModelLoader):
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+index 70482bf8798ff39aff80fe3236c1bd8ce087a830..7520e8f3266a07cf4db8827563a8e1b385574917 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+@@ -1080,6 +1080,23 @@
+         """Whether neither a confirmed nor an in-flight external copy exists."""
+         return not node.external_cache_stored and node.write_through_pending_id is None
+ 
++    def finish_deferred_chunked_backup(self, node_id: NodeId) -> list[CacheAction]:
++        """Account for one request's suppressed chunked write-through hit."""
++        node = self._node_arena.get(node_id)
++        if (
++            not self.enable_hicache
++            or node is None
++            or node is self.root_node
++            or node.backuped
++            or node.write_through_pending_id is not None
++            or node.component_data[ComponentType.FULL].lock_ref <= 0
++            or node.component_data[ComponentType.MAMBA].value is None
++        ):
++            return []
++        if self._inc_hit_count_and_check(node):
++            return [self._build_backup_kv_action(node)]
++        return []
++
+     def begin_insert(self, params: InsertParams) -> InsertStepResult:
+         """Start the insert, running to its first barrier or completion."""
+         # Insert walks are single-flight; a live walk means re-entrancy.
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
+index 4698fc105e9e42de40d1ac191c18298972b85656..214195d313d17a9463b9a264b69a335ca28a7c2d 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
+@@ -465,6 +465,10 @@
+         """Concatenate FULL device values from from_node up to (exclusive) until_node."""
+         ...
+ 
++    def finish_deferred_chunked_backup(self, node_id: NodeId) -> list[CacheAction]:
++        """Optional completion hook for a protected chunked Mamba checkpoint."""
++        return []
++
+     @abstractmethod
+     def begin_insert(self, params: InsertParams) -> InsertStepResult:
+         """Start the (single-flight) insert, running to its first barrier or completion."""
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index 421a2157228489da4c251c8ac26ef8135451b5b2..5267d7a9ba14d0a62ca4ef1441b1a0b86ea82683 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -997,6 +997,7 @@
+ 
+     @rank_consensus(same_params=["req.rid", "inserted"])
+     def on_release(self, req: Req, *, inserted: bool) -> None:
++        req._hicache_deferred_chunked_backup = None
+         if inserted:
+             return
+         for comp in self._components_tuple:
+@@ -1004,6 +1005,9 @@
+ 
+     @rank_consensus(same_params=["req.rid", "up_to"])
+     def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
++        deferred_backup = req._hicache_deferred_chunked_backup
++        req._hicache_deferred_chunked_backup = None
++
+         if self.disable:
+             for comp in self._components_tuple:
+                 comp.cleanup_after_caching_req(req, is_finished=True)
+@@ -1084,6 +1088,26 @@
+                 )
+             )
+ 
++        if (
++            deferred_backup is not None
++            and self.cache_controller is not None
++            and self.enable_mamba_extra_buffer
++            and result.last_device_node == self.tree_core.root_node.id
++            and req.kv.cache_protected_len > 0
++            and deferred_backup
++            == (self.tree_core.root_node.id, req.last_node, req.kv.cache_protected_len)
++        ):
++            from sglang.srt.managers.schedule_batch import FINISH_ABORT
++
++            # A final short tail has no new Mamba checkpoint. Account for the
++            # suppressed chunked hit while the existing checkpoint is locked.
++            if req.finished_reason is not None and not isinstance(
++                req.finished_reason, FINISH_ABORT
++            ):
++                self._apply_cache_actions(
++                    self.tree_core.finish_deferred_chunked_backup(req.last_node)
++                )
++
+         # Everything past the inserted key goes back to the caller, the
+         # protected prefix never does. After a rotation decline nothing was
+         # inserted.
+@@ -1290,6 +1314,15 @@
+             req.prefix_indices = new_indices
+         req.kv.cache_protected_len = len(new_indices)
+         req.last_node = new_last_node
++        req._hicache_deferred_chunked_backup = (
++            (self.tree_core.root_node.id, new_last_node, len(new_indices))
++            if chunked
++            and self.cache_controller is not None
++            and self.enable_mamba_extra_buffer
++            and len(new_indices) > 0
++            and new_last_node != self.tree_core.root_node.id
++            else None
++        )
+         # Carry the receipt so this node's dec releases only what we locked.
+         req.lock_receipt = lock_result.to_dec_params()
+         # The rematch acquired a new SWA prefix lock.
+diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers/dp_attention.py
+index bf6c1e8f67431f80fd69a7cc180e1fc25eafb1dc..b0a440f5bc9b5851158d54cc0942b7c46710a582 100644
+--- a/python/sglang/srt/layers/dp_attention.py
++++ b/python/sglang/srt/layers/dp_attention.py
+@@ -1017,13 +1017,27 @@
+         if sizes is not None:
+             get_parallel().tp_group.reduce_scatterv(input, output=output, sizes=sizes)
+             return
++    # Accumulate BF16 partial sums in FP32 before returning the original dtype.
++    reduce_input = input
++    if input.dtype == torch.bfloat16:
++        with use_symmetric_memory(get_parallel().tp_group, disabled=not is_dp_max_padding()):
++            reduce_input = input.float()
+     if get_parallel().tp_size == get_parallel().attn_dp_size:
+-        get_parallel().tp_group.reduce_scatter_tensor(output, input)
++        reduce_output = output
++        if reduce_input.dtype != output.dtype:
++            with use_symmetric_memory(get_parallel().tp_group, disabled=not is_dp_max_padding()):
++                reduce_output = torch.empty_like(output, dtype=reduce_input.dtype)
++        get_parallel().tp_group.reduce_scatter_tensor(reduce_output, reduce_input)
++        if reduce_output is not output:
++            output.copy_(reduce_output)
+     else:
+-        scattered_local_tokens = input.tensor_split(get_parallel().tp_size)[
++        scattered_local_tokens = reduce_input.tensor_split(get_parallel().tp_size)[
+             get_parallel().tp_rank
+         ]
+-        get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, input)
++        get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, reduce_input)
++        if scattered_local_tokens.dtype != output.dtype:
++            with use_symmetric_memory(get_parallel().attn_tp_group, disabled=not is_dp_max_padding()):
++                scattered_local_tokens = scattered_local_tokens.to(output.dtype)
+         get_parallel().attn_tp_group.all_gather_into_tensor(
+             output, scattered_local_tokens
+         )
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index 37c6732744d876e3b6a79aac8f534b1b8f7c6dce..80aa88c286f2637eb9c8a4d26f3045e25a2fee17 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -1286,7 +1286,15 @@
+             else:
+                 assert output.shape == output_shape
+ 
+-            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
++            # Variable-size MoE partial sums use the same FP32 accumulation.
++            reduce_input = input_
++            reduce_output = output
++            if input_.dtype == torch.bfloat16:
++                reduce_input = input_.float()
++                reduce_output = torch.empty_like(output, dtype=torch.float32)
++            pynccl_comm.reduce_scatter(reduce_output, reduce_input, sizes=sizes)
++            if reduce_output is not output:
++                output.copy_(reduce_output)
+             return output
+ 
+     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):

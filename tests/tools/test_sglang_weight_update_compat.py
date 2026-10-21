@@ -607,6 +607,15 @@ class TestPatchSourceExtraction(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "Source does not match"):
             _validated_source(source, self._patch(replacement=3), "example.py")
 
+    def test_multiple_patches_validate_pristine_and_final_sources(self) -> None:
+        first = self._patch()
+        intermediate = apply_file_patch(self.source, first, "example.py")
+        second = self._patch(replacement=3).replace(_blob_hash(self.source), _blob_hash(intermediate))
+        second = second.replace("-        value = 1", "-        value = 2")
+        expected = intermediate.replace("value = 2", "value = 3")
+        self.assertEqual(_validated_source(self.source, first, "example.py", (second,)), expected)
+        self.assertEqual(_validated_source(expected, first, "example.py", (second,)), expected)
+
     def test_wrong_source_outside_patch_context_is_rejected(self) -> None:
         source = self.source.replace("return value + 10", "return value + 20")
         with self.assertRaisesRegex(AssertionError, "Source does not match"):
