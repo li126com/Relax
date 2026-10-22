@@ -13,7 +13,10 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from relax.models.deepseekv41.engram import (
+
+pytest.importorskip("megatron.core.extensions.transformer_engine")
+
+from relax.models.deepseekv41.engram import (  # noqa: E402
     DeepSeekV41Engram,
     _engram_gate,
     _mmap_rows,

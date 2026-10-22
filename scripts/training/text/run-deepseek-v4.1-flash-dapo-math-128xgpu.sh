@@ -209,6 +209,12 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
     exit 0
 fi
 
+RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-${RAY_DASHBOARD_ADDRESS:-${RAY_ADDRESS:-http://127.0.0.1:8265}}}"
+if [[ "${RAY_JOB_ADDRESS}" != http://* && "${RAY_JOB_ADDRESS}" != https://* ]]; then
+    echo "Set RAY_JOB_ADDRESS or RAY_DASHBOARD_ADDRESS to the existing cluster's Ray Jobs HTTP address." >&2
+    exit 1
+fi
+
 mkdir -p "${LOG_DIR}"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOB_ADDRESS}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \

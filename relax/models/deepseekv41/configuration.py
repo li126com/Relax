@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""HF configuration compatibility for the V4.1 text-training
-architecture."""
+"""HF configuration compatibility for the V4.1 text-training architecture."""
 
 from argparse import Namespace
 from copy import deepcopy
@@ -133,8 +132,6 @@ def configure_runtime(provider: Any, args: Namespace) -> None:
     from .execution_config import configure_execution_runtime
 
     if getattr(args, "mtp_num_layers", None):
-        raise ValueError(
-            "DeepSeek V4.1 supports text-only training; MTP/DSpark training is unsupported."
-        )
+        raise ValueError("DeepSeek V4.1 supports text-only training; MTP/DSpark training is unsupported.")
     provider.mtp_num_layers = None
     configure_execution_runtime(provider, args)

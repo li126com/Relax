@@ -36,7 +36,7 @@ FROM base as train
 
 # FA2 uses generic SM100 cubins on both B200 (SM100) and B300 (SM103).
 # This version's build script accepts "100", not "103".
-RUN FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS="90;100" MAX_JOBS=64 \
+RUN FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS="80;90;100" MAX_JOBS=64 \
     pip -v install flash-attn==2.7.4.post1 --force-reinstall --no-deps --no-build-isolation --no-cache-dir && \
     pip install --no-cache-dir flash-linear-attention==0.5.2
 
@@ -88,7 +88,7 @@ RUN NVTE_PYTORCH_FORCE_BUILD=TRUE MAX_JOBS=32 \
     pip -v install --no-cache-dir --no-build-isolation "transformer_engine[core_cu13,pytorch]==2.18.0" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall --no-deps && \
     pip install "nvidia-modelopt==0.44.0" --no-build-isolation --no-cache-dir && \
-    TORCH_CUDA_ARCH_LIST="9.0;10.0;10.3" NVCC_APPEND_FLAGS="--threads 32" \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0;10.3" NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --force-reinstall --no-deps --disable-pip-version-check --no-cache-dir \
     --no-build-isolation \
     --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
@@ -107,7 +107,7 @@ WORKDIR /root
 # Build the INT4 fake-quant CUDA extension required by INT4 QAT rollout weight sync.
 COPY relax/backends/megatron/kernels/int4_qat /tmp/int4_qat
 RUN cd /tmp/int4_qat && \
-    TORCH_CUDA_ARCH_LIST="9.0;10.0;10.3" pip install . --no-deps --no-build-isolation --no-cache-dir && \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0;10.3" pip install . --no-deps --no-build-isolation --no-cache-dir && \
     rm -rf /tmp/int4_qat
 
 ARG TRAIN_IMAGE=train

@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Modified for Relax integration; see NOTICE.
 
 """V4.1 text execution with model-instance-owned cross-layer state."""
 
@@ -194,7 +195,8 @@ def get_v41_spec(
 
 
 def _freeze_routers(model: GPTModel) -> None:
-    """Freeze routing weights while preserving gradients through routing inputs."""
+    """Freeze routing weights while preserving gradients through routing
+    inputs."""
     for layer in model.decoder.layers:
         router = getattr(layer.mlp, "router", None)
         if router is not None:

@@ -1,8 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Modified for Relax integration; see NOTICE.
 
 """Instance-owned cross-layer state and tensor carry for the V4.1 text model.
 
-The carry layout is derived from the layer plan instead of reading a GPU metadata header on every layer.
+The carry layout is derived from the layer plan instead of reading a GPU
+metadata header on every layer.
 """
 
 from __future__ import annotations

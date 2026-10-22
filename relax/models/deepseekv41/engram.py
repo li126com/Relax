@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Modified for Relax integration; see NOTICE.
 
 """Frozen CPU-mapped Engram tables and the trainable V4.1 retrieval gate."""
 

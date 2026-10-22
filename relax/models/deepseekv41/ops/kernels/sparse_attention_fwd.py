@@ -1,6 +1,6 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
-# Reference: https://github.com/tile-ai/tilelang/blob/e666d2d3cc483829c57618c9ebf2e4f4ada0819d/examples/deepseek_v32/sparse_mla_fwd.py
+# ruff: noqa
+# Adapted from https://github.com/tile-ai/tilelang/blob/e666d2d3cc483829c57618c9ebf2e4f4ada0819d/examples/deepseek_v32/sparse_mla_fwd.py
+# Modified for Relax integration; see NOTICE.
 
 import tilelang
 import torch

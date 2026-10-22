@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Execution limits of the V4.1 text model, not HF
-architecture overrides."""
+"""Execution limits of the V4.1 text model, not HF architecture overrides."""
 
 from argparse import Namespace
 from typing import Any
@@ -86,9 +85,7 @@ def validate_execution_config(provider: Any) -> None:
     _validate_runtime_layout(provider)
     dtype = str(provider.params_dtype).removeprefix("torch.")
     if dtype != "bfloat16" or getattr(provider, "fp8", None) or getattr(provider, "fp4", None):
-        raise ValueError(
-            "DeepSeek V4.1 requires BF16 training; FP16/FP32/FP8/FP4 compute is unsupported."
-        )
+        raise ValueError("DeepSeek V4.1 requires BF16 training; FP16/FP32/FP8/FP4 compute is unsupported.")
     for field, expected in (("kv_lora_rank", 512), ("qk_pos_emb_head_dim", 64), ("csa_window_size", 128)):
         actual = getattr(provider, field)
         if actual != expected:

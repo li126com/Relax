@@ -14,7 +14,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from relax.models.deepseekv41.ops import compressor, indexer, position, quant
+
+pytest.importorskip("megatron.core.extensions.transformer_engine")
+
+from relax.models.deepseekv41.ops import compressor, indexer, position, quant  # noqa: E402
 
 
 _KERNEL_PACKAGE = "relax.models.deepseekv41.ops.kernels"

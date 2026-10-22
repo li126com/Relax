@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Modified for Relax integration; see NOTICE.
 
 from typing import Any
 

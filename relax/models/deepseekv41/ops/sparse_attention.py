@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Modified for Relax integration; see NOTICE.
 
 """Sparse attention over top-k selected KV rows (DeepSeek Sparse Attention
 core).
