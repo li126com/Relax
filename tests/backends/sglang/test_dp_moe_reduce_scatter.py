@@ -101,7 +101,6 @@ def _combine(rank: int, dp_size: int, dtype, *, variable: bool = False):
         "get_parallel": lambda: SimpleNamespace(
             tp_size=tp_size, tp_rank=rank, attn_dp_size=dp_size, tp_group=tp, attn_tp_group=attn
         ),
-        "_note_dp_gather_in_prefill_graph": lambda: None,
         "use_symmetric_memory": symmetric_memory,
         "is_dp_max_padding": lambda: True,
     }
