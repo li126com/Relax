@@ -270,8 +270,13 @@ fi
 
 # Resolve training dependency constraints after all other package installs.
 # grpcio-tools must stay on protobuf 6 alongside CUTLASS and gRPC health/reflection.
+# NIXL 1.5.0 requires both CUDA backend wheels.
 RUN pip install --no-cache-dir packaging==25.0 protobuf==6.33.6 grpcio-tools==1.81.1 \
-        hydra-core==1.3.2 typeguard==4.6.0 pillow==11.3.0 imageio==2.38.1
+        hydra-core==1.3.2 typeguard==4.6.0 pillow==11.3.0 imageio==2.38.1 nixl-cu12==1.5.0
+
+# Keep one OpenCV provider after resolving the base image metadata.
+RUN pip uninstall -y opencv-python-headless && \
+    pip install --no-cache-dir opencv-python==4.10.0.84
 
 # Restore the official DeepEP runtime after Torch's NCCL dependency resolution.
 RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7
