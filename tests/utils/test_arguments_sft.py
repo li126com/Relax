@@ -185,3 +185,11 @@ def test_static_bshd_sft_requires_single_sample_and_bounded_skip(arguments_modul
 
     assert args.qkv_format == "bshd" and not args.use_dynamic_batch_size
     assert args.balance_data and not args.compute_advantages_and_returns
+
+
+@pytest.mark.parametrize("cli,expected", [([], "balanced"), (["--sft-packing-strategy", "binpack"], "binpack")])
+def test_sft_packing_preserves_default_and_archived_recipe(arguments_module, cli, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    assert parser.parse_args(cli).sft_packing_strategy == expected

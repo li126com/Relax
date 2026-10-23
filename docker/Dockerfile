@@ -1,8 +1,10 @@
+# syntax=docker/dockerfile:1.7
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.21-cu130
 ARG TRAIN_IMAGE=train
+ARG HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
 # One amd64 image for Hopper and Blackwell; GPU kernels select their backend at runtime.
 FROM ${BASE_IMAGE} as base
 
@@ -111,10 +113,29 @@ RUN cd /tmp/int4_qat && \
     rm -rf /tmp/int4_qat
 
 ARG TRAIN_IMAGE=train
+# Build HybridEP for Hopper and Blackwell against the final image's Torch/CUDA ABI.
+FROM ${TRAIN_IMAGE} as hybridep_builder
+COPY docker/patch/deepep/eb9cee7-hybridep-namespace.patch /tmp/hybridep-namespace.patch
+ARG HYBRID_EP_COMMIT
+ARG HYBRID_EP_CUDA_ARCH_LIST="9.0;10.0a;10.3a"
+RUN pip install --no-deps "nvidia-nvshmem-cu13==3.4.5" "pynvml==13.0.1" && \
+    git clone --no-checkout https://github.com/deepseek-ai/DeepEP.git /tmp/HybridEP && \
+    cd /tmp/HybridEP && git checkout --detach "$HYBRID_EP_COMMIT" && \
+    test "$(git rev-parse HEAD)" = "$HYBRID_EP_COMMIT" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/hybridep-namespace.patch && \
+    CUDA_VISIBLE_DEVICES="" TORCH_CUDA_ARCH_LIST="$HYBRID_EP_CUDA_ARCH_LIST" HYBRID_EP_MULTINODE=0 \
+        CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}" \
+        LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+        MAX_JOBS=16 pip wheel --no-build-isolation --no-deps --wheel-dir /opt/ep-wheels .
+
 # Build the patched router against the same Python/libc as the final image.
 FROM ${TRAIN_IMAGE} as router_builder
 
 ARG ROUTER_RUST_VERSION=1.97.1
+# Override these build args when CI requires an approved Rust mirror.
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+ARG ROUTER_RUSTUP_INIT_URL=https://sh.rustup.rs
 ARG ROUTER_BUILD_JOBS=16
 ENV PATH=/root/.cargo/bin:${PATH} \
     CARGO_BUILD_JOBS=${ROUTER_BUILD_JOBS} \
@@ -123,8 +144,15 @@ ENV PATH=/root/.cargo/bin:${PATH} \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl git libssl-dev pkg-config protobuf-compiler && \
     rm -rf /var/lib/apt/lists/* && \
-    curl --proto '=https' --tlsv1.2 --fail --location https://sh.rustup.rs -o /tmp/rustup-init.sh && \
-    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${ROUTER_RUST_VERSION}" && \
+    curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --retry-all-errors \
+        --connect-timeout 30 --max-time 300 "$ROUTER_RUSTUP_INIT_URL" -o /tmp/rustup-init.sh && \
+    (for attempt in 1 2 3; do \
+        if sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${ROUTER_RUST_VERSION}"; then \
+            exit 0; \
+        fi; \
+        if [ "$attempt" -eq 3 ]; then exit 1; fi; \
+        sleep 5; \
+    done) && \
     python -m pip install --no-cache-dir "maturin==1.9.6"
 COPY docker/patch/sglang-router /tmp/router-patch
 COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
@@ -136,6 +164,8 @@ WORKDIR /root
 
 ARG PATCH_VERSION=latest
 ARG ENABLE_SGLANG_PATCH=1
+ARG HYBRID_EP_COMMIT
+ENV RELAX_HYBRID_EP_COMMIT=${HYBRID_EP_COMMIT}
 
 ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
@@ -157,10 +187,14 @@ RUN wget -q https://github.com/apptainer/apptainer/releases/download/v1.4.1/appt
 
 COPY requirements.txt /tmp/requirements.txt
 
-RUN pip install --ignore-installed PyJWT && \
+RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq-assignment.patch \
+    pip install --no-cache-dir "ray[default,serve]==2.56.1" && \
+    pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps
+    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
+    TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
 
 # MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
 # Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.
@@ -176,6 +210,16 @@ COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-p
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
     patch --batch --forward -p1 < /tmp/fla-kda-backward-precision.patch
 
+# Install all convolution entries; each training process selects its mode at import.
+ENV RELAX_FLA_CONV_NB_MODE=auto
+COPY docker/patch/fla/0.5.2-qwen38-output-config.patch /tmp/fla-output-config.patch
+COPY docker/patch/fla/0.5.2-conv-static-entries.patch /tmp/fla-conv-entries.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-output-config.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-conv-entries.patch && \
+    python -m compileall -q fla/modules/conv/triton && \
+    rm /tmp/fla-output-config.patch /tmp/fla-conv-entries.patch
+
 # Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
@@ -189,6 +233,9 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
 COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
 COPY docker/scripts/setup_memory_saver.py /tmp/setup_memory_saver.py
+COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
@@ -196,7 +243,13 @@ RUN cd Megatron-LM && \
     exit 1; \
     fi && \
     patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
-    rm megatron.patch sync-save-bounded-staging.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
+    sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
+    sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
+    python -m compileall -q megatron && \
+    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch && \
     apt update && apt install -y jq && \
     python /tmp/setup_memory_saver.py
 
@@ -231,5 +284,20 @@ RUN apt-get remove -y --purge --allow-change-held-packages \
 # TE can load NCCL before Torch; prefer the restored wheel over the system library.
 ENV LD_LIBRARY_PATH=/opt/sglang/lib/python${PYVER}/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH}
 
-# Run the GPU import/operator smoke check inside the built container on each GPU family.
-COPY docker/scripts/check_gpu_imports.py /opt/relax/check_gpu_imports.py
+# Keep legacy FLA isolated for recipes that explicitly select it.
+COPY docker/scripts/install_legacy_fla.py \
+    docker/scripts/validate_hybridep_install.py \
+    docker/scripts/record_qwen35_runtime.py \
+    docker/scripts/validate_final_runtime.py \
+    docker/scripts/check_gpu_imports.py /opt/relax/
+COPY docker/patch/fla/0.4.2-legacy-runtime.patch /tmp/fla042.patch
+RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2 \
+        --patch /tmp/fla042.patch --manifest /etc/relax-fla042-runtime.json && \
+    rm /tmp/fla042.patch
+
+COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
+RUN pip install --no-deps "nvidia-nvshmem-cu13==3.4.5" "pynvml==13.0.1" && \
+    pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
+    rm -r /tmp/ep-wheels && \
+    python /opt/relax/validate_hybridep_install.py && \
+    python /opt/relax/validate_final_runtime.py --profile unified
