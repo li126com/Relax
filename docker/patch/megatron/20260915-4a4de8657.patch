@@ -772,7 +772,43 @@ index e0f7c9f..1d3c4e4 100644
 diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 --- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 +++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-@@ -249,6 +249,11 @@
+@@ -1,6 +1,6 @@
+ # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
+ from collections import defaultdict
+-from typing import Dict
++from typing import Callable, Dict
+
+ import torch
+
+@@ -76,6 +76,14 @@
+         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
+         self.param_update_in_fp32 = param_update_in_fp32
+         self.sub_optimizer_kwargs = kwargs
++        # Optional parameter-local replacement for CPU master -> GPU copy-back.
++        # Callbacks enqueue work on the current _h2d_stream; the existing event
++        # below fences their work before the training stream consumes weights.
++        # Keep this instance mapping outside _init_sub_optimizers: state loading
++        # rebuilds sub-optimizers, but does not replace the callback contract.
++        self._param_copy_back_gpu_callbacks: Dict[
++            torch.Tensor, Callable[[torch.Tensor, torch.Tensor], None]
++        ] = {}
+
+         self._init_sub_optimizers()
+         self._register_load_state_dict_hooks()
+@@ -121,7 +129,11 @@
+                 with torch.cuda.stream(self._h2d_stream):
+                     for param in _param_generator(optimizer):
+                         gpu_param = self.cpu_copys_map_gpu_param[param]
+-                        gpu_param.data.copy_(param.data, non_blocking=True)
++                        callback = self._param_copy_back_gpu_callbacks.get(gpu_param)
++                        if callback is None:
++                            gpu_param.data.copy_(param.data, non_blocking=True)
++                        else:
++                            callback(gpu_param, param)
+                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
+
+             return param_copy_back_gpu_hook
+@@ -249,6 +261,11 @@
          return cpu_optimizers
  
      def _get_sub_optimizer_param_groups(self, offload_fraction: float):
@@ -784,7 +820,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
          params = []
          for group in self.param_groups:
              params.extend(group["params"])
-@@ -276,6 +281,8 @@
+@@ -276,6 +293,8 @@
                      cpu_copy = True
                  if self.param_update_in_fp32 and param.dtype != torch.float32:
                      param = param.detach().clone().float()
@@ -793,7 +829,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
                      param_to_fp32_param[orig_param] = param
 
                  if cpu_copy:
-@@ -370,11 +377,11 @@
+@@ -370,11 +389,11 @@
          if not self.param_update_in_fp32:
              return
          for param, v in self.state.items():
@@ -810,7 +846,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
  
      def update_fp32_param_by_new_param(self):
          """
-@@ -382,6 +389,16 @@
+@@ -382,6 +401,16 @@
          """
          for param, fp32_param in self.param_to_fp32_param.items():
              fp32_param.data.copy_(param)
@@ -1212,6 +1248,72 @@ index 1be7733..ab01220 100644
              indexer_topk_idxs_for_loss = indexer_topk_idxs
              if q_padding_mask is not None:
                  indexer_topk_idxs_for_loss = indexer_topk_idxs.masked_fill(
+diff --git a/megatron/core/transformer/experimental_attention_variant/csa_utils/thd_layout_kernels.py b/megatron/core/transformer/experimental_attention_variant/csa_utils/thd_layout_kernels.py
+--- a/megatron/core/transformer/experimental_attention_variant/csa_utils/thd_layout_kernels.py
++++ b/megatron/core/transformer/experimental_attention_variant/csa_utils/thd_layout_kernels.py
+@@ -784,6 +784,7 @@
+
+
+ _COMPILED_LAUNCH_CACHE = {}
++_COMPILED_SIGNATURE_CACHE = {}
+
+
+ def _run_compiled_launch(
+@@ -794,12 +795,15 @@
+ ) -> None:
+     """Compile/cache a CuTe launch function and invoke it on the current stream."""
+     static_arg_set = set(static_arg_indices)
++    static_args = tuple((i, scalar_args[i]) for i in static_arg_indices)
++    device = tensor_args[0].device
+     key = (
+-        launch_fn.__name__,
++        launch_fn,
++        device,
+         tuple(
+             (tensor.dtype, tuple(tensor.shape), tuple(tensor.stride())) for tensor in tensor_args
+         ),
+-        tuple((i, scalar_args[i]) for i in static_arg_indices),
++        static_args,
+     )
+     compiled = _COMPILED_LAUNCH_CACHE.get(key)
+     if compiled is None:
+@@ -816,16 +820,28 @@
+             if tensor.ndim != 0:
+                 cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=tensor.ndim - 1)
+             cute_tensor_args.append(cute_tensor)
+-        compiled = cute.compile(
++        # Reuse the exact signature defined by CuTe after layout conversion.
++        # Keep the shape cache above so repeated shapes do not redo DLPack conversion.
++        signature_key = (
+             launch_fn,
+-            *cute_tensor_args,
+-            *(
+-                arg if i in static_arg_set else cutlass.Int32(arg)
+-                for i, arg in enumerate(scalar_args)
+-            ),
+-            make_fake_stream(use_tvm_ffi_env_stream=False),
+-            options=f"--enable-tvm-ffi --gpu-arch {arch}",
++            device,
++            arch,
++            tuple(tensor.__cache_key__ for tensor in cute_tensor_args),
++            static_args,
+         )
++        compiled = _COMPILED_SIGNATURE_CACHE.get(signature_key)
++        if compiled is None:
++            compiled = cute.compile(
++                launch_fn,
++                *cute_tensor_args,
++                *(
++                    arg if i in static_arg_set else cutlass.Int32(arg)
++                    for i, arg in enumerate(scalar_args)
++                ),
++                make_fake_stream(use_tvm_ffi_env_stream=False),
++                options=f"--enable-tvm-ffi --gpu-arch {arch}",
++            )
++            _COMPILED_SIGNATURE_CACHE[signature_key] = compiled
+         _COMPILED_LAUNCH_CACHE[key] = compiled
+     compiled(
+         *tensor_args,
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
 index 4ce5ebf..d39ca64 100644
 --- a/megatron/core/transformer/moe/moe_utils.py
