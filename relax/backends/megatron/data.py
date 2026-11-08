@@ -411,6 +411,25 @@ def _build_allgather_thd_metadata(
     return real_cu_seqlens, padded_cu_seqlens, max_seqlen, padding_mask
 
 
+def _prebuild_vlm_static_cp_route(
+    packed_seq_params: PackedSeqParams,
+    physical_offsets: list[int],
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+) -> None:
+    """Build a per-microbatch layout route from producer-owned CPU boundaries."""
+    if cp_size <= 1:
+        return
+    try:
+        from megatron.core.context_parallel_layout.routes import build_thd_cp_partition_route
+    except ImportError:
+        # Older Megatron pins do not use this layout-route API.
+        return
+    cpu_offsets = torch.tensor(physical_offsets, dtype=torch.int64, device="cpu")
+    packed_seq_params.cp_partition_route = build_thd_cp_partition_route(cpu_offsets, cp_size, cp_rank, device=device)
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -583,6 +602,10 @@ def get_batch(
             for length in seqlens_padded:
                 select_offsets.append(select_offsets[-1] + length)
             vlm_packed_seq_params.cu_seqlens_q_cpu = select_offsets
+            # Restrict the route to resident, static-CP VLM batches. CPU prepacking
+            # needs separate route-index transfer/record_stream support.
+            if is_vl_model and pack_device is None and not use_dynamic_context_parallel and device.type == "cuda":
+                _prebuild_vlm_static_cp_route(vlm_packed_seq_params, select_offsets, cp_size, cp_rank, device)
             vlm_packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
             if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
                 bind_physical_layout(vlm_packed_seq_params, tuple(select_offsets))

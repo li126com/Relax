@@ -292,3 +292,74 @@ class PackedExpertGather:
         if self._parts:
             return [(name, output.narrow(0, start, count)) for name, start, count in self._parts]
         return [(self._name, output)]
+
+
+class PipelineExpertGather:
+    """Gather on the owning PP stage, then broadcast one packed buffer.
+
+    Only CPU layout descriptors survive an update. Both process groups are
+    supplied by the caller so offload/reload can replace their communicators.
+    """
+
+    def __init__(self, gather: PackedExpertGather, source_stage: int) -> None:
+        if source_stage < 0:
+            raise ValueError("Packed expert source stage must be nonnegative")
+        self._gather = gather
+        self._source_stage = source_stage
+        self._layout: tuple[TensorLayout, ...] | None = None
+        self._pipeline_ranks: tuple[int, ...] | None = None
+
+    def __call__(
+        self,
+        tensors: Sequence[NamedTensor],
+        *,
+        group: dist.ProcessGroup,
+        device: torch.device,
+        pipeline_group: dist.ProcessGroup,
+    ) -> list[NamedTensor]:
+        ranks = tuple(dist.get_process_group_ranks(pipeline_group))
+        if self._source_stage >= len(ranks):
+            raise ValueError("Packed expert source stage is outside the pipeline group")
+        if self._pipeline_ranks is not None and ranks != self._pipeline_ranks:
+            raise ValueError("Packed expert pipeline topology changed; rebuild the gather plan")
+        source = ranks[self._source_stage]
+        owns_projection = dist.get_rank(group=pipeline_group) == self._source_stage
+        gathered = self._gather(tensors, group=group, device=device) if owns_projection else None
+        if not owns_projection and tensors:
+            raise ValueError("Only the owning pipeline stage may supply packed experts")
+        current_layout = _layout(gathered) if gathered is not None else None
+        if self._layout is None:
+            metadata = [current_layout]
+            dist.broadcast_object_list(metadata, src=source, group=pipeline_group)
+            self._layout = metadata[0]
+            self._pipeline_ranks = ranks
+        elif owns_projection and current_layout != self._layout:
+            raise ValueError("Packed expert pipeline layout changed; rebuild the gather plan")
+
+        size = sum(entry[2] for entry in self._layout)
+        if gathered is not None:
+            if not gathered:
+                raise ValueError("Packed expert pipeline output must not be empty")
+            first = gathered[0][1]
+            storage_pointer = first.untyped_storage().data_ptr()
+            offset = 0
+            for _, tensor in gathered:
+                if (
+                    not tensor.is_contiguous()
+                    or tensor.storage_offset() != offset
+                    or tensor.untyped_storage().data_ptr() != storage_pointer
+                ):
+                    raise ValueError("Packed expert views must cover one contiguous storage")
+                offset += tensor.numel()
+            # PackedExpertGather's range views cover its buffer in order. Reuse
+            # that allocation instead of concatenating a second full copy.
+            flattened = first.as_strided((size,), (1,))
+        else:
+            flattened = torch.empty(size, dtype=torch.bfloat16, device=device)
+        dist.broadcast(flattened, src=source, group=pipeline_group, async_op=True).wait()
+
+        result, offset = [], 0
+        for name, shape, count in self._layout:
+            result.append((name, flattened.narrow(0, offset, count).view(shape)))
+            offset += count
+        return result

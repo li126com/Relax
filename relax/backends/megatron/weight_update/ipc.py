@@ -17,6 +17,7 @@ def dispatch_typed_buckets(
     empty_flattened: Callable[[], dict[str, Any]],
     held: list[Any],
     dispatch_errors: list[str] | None = None,
+    native_target_only: bool = False,
 ) -> list[Any]:
     """Keep a single request format even with empty or differently packed
     ranks.
@@ -43,6 +44,10 @@ def dispatch_typed_buckets(
                             empty[load_format] = serializer.serialize(payload, output_str=True)
                         serialized.append(empty[load_format])
                 kwargs = dict(serialized_named_tensors=serialized, load_format=load_format)
+                if native_target_only and load_format in ("direct", EXPERT_SLICE_LOADER):
+                    # Native parameters name the target model's experts. MTP
+                    # tensors retain HF loading on both runners in the session.
+                    kwargs["selector"] = "target"
                 if version is not None:
                     kwargs["weight_version"] = str(version)
                 refs.append(engine.update_weights_from_tensor.remote(**kwargs))

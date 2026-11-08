@@ -327,9 +327,10 @@ class UpdateWeightFromTensor:
         Pipelining: overlap chunk N's IPC transfer with chunk N+1's HF
         conversion + serialization + Gloo gather.  At most two chunks'
         GPU tensors are alive simultaneously (bounded by
-        ``update_weight_buffer_size``). Routed expert mode instead completes
-        each IPC before advancing the iterator, so conversion failures cannot
-        release buffers that a receiver is still reading.
+        ``update_weight_buffer_size``). Routed experts and PP packed experts
+        complete each IPC before advancing the iterator, so conversion failures
+        cannot release buffers that a receiver is still reading, and PP relay
+        buffers do not overlap the previous chunk's storage.
 
         In LoRA merge mode the adapters are folded into the base weights during
         HF export so the rollout engine serves one merged model; otherwise all
@@ -401,6 +402,7 @@ class UpdateWeightFromTensor:
         prev_long_lived_tensors = None
         current_refs: list[ObjectRef] = []
         long_lived_tensors = None
+        serial_chunks = self._serial_weight_chunks()
         try:
             with export_ctx:
                 for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
@@ -408,10 +410,10 @@ class UpdateWeightFromTensor:
                     current_refs, long_lived_tensors = self._send_hf_params(
                         hf_named_tensors, dispatch_errors=dispatch_errors
                     )
-                    # Routed export agrees on failures before advancing its
-                    # collective generator. Ordinary export keeps two chunks
-                    # overlapped, including the previous chunk's storage.
-                    if self._route_experts:
+                    # Serial export agrees on completion/failures on every
+                    # rank before releasing IPC storage and advancing the
+                    # collective generator. Other paths keep two chunks live.
+                    if serial_chunks:
                         self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors) or None)
                         current_refs = []
                     else:
@@ -421,7 +423,7 @@ class UpdateWeightFromTensor:
                             self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors))
                     prev_long_lived_tensors = long_lived_tensors
                     prev_refs, current_refs = current_refs, []
-                    if self._route_experts:
+                    if serial_chunks:
                         prev_long_lived_tensors = long_lived_tensors = None
                         del hf_named_tensors
                     device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
@@ -471,6 +473,11 @@ class UpdateWeightFromTensor:
                 error = str(exc)
         self._wait_for_ipc(refs, error=error)
 
+    def _serial_weight_chunks(self) -> bool:
+        return self._route_experts or bool(
+            getattr(getattr(self, "_hf_weight_iterator", None), "requires_serial_weight_chunks", False)
+        )
+
     def _wait_for_ipc(self, refs: list[ObjectRef], *, error: str | None = None) -> None:
         try:
             results = ray.get(refs) if refs else []
@@ -482,12 +489,13 @@ class UpdateWeightFromTensor:
             # ray.get(list) may raise before other requests finish. Keep source
             # buffers alive until every submitted reader has completed/failed.
             _drain_ipc_refs(refs)
-        if not self._route_experts:
+        if not self._serial_weight_chunks():
             if error is not None:
                 raise RuntimeError(f"Weight load failed: {error}")
             return
-        # All ranks finish the same IPC rounds. Propagate a receiver failure
-        # before anyone proceeds to another all-to-all or publishes a version.
+        # Only IPC leaders hold Ray refs. Nonleaders must join the completion
+        # agreement before releasing their CUDA IPC buffers. Propagate errors
+        # before anyone enters another collective or publishes a version.
         failed = torch.tensor([int(error is not None)], dtype=torch.int32, device="cpu")
         dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=get_gloo_group())
         if failed.item():
@@ -877,6 +885,7 @@ def _send_to_colocated_engine(
             empty_flattened=lambda: _empty_flattened_tensor_data(cur_device),
             held=long_live_tensors,
             dispatch_errors=errors,
+            native_target_only=bool(direct_layout and direct_layout.target_only),
         )
         if errors and dispatch_errors is None:
             _drain_ipc_refs(refs)

@@ -1639,14 +1639,6 @@ class StreamingTQIterator:
         self._batch_index += 1
         self._mb_count += 1
 
-        adv_info = ""
-        if "advantages" in data:
-            advs = data["advantages"]
-            if isinstance(advs, list) and len(advs) > 0:
-                adv_vals = [a.float().mean().item() if hasattr(a, "mean") else float(a) for a in advs]
-                adv_info = (
-                    f" adv_means=[{','.join(f'{v:.4f}' for v in adv_vals[:4])}{'...' if len(adv_vals) > 4 else ''}]"
-                )
         # ``samples`` reports GLOBAL window progress (sum across all dps) vs the
         # window quota, so it monotonically approaches ``window_quota`` (e.g.
         # 256).  The controller piggybacks this global count on the fetched
@@ -1659,7 +1651,7 @@ class StreamingTQIterator:
             window_progress = self._sample_count
         logger.info(
             "[StreamingTQIterator] rollout=%s mini=%d dp=%d/%d mb=%d source=%s tq_wait=%.3fs "
-            "n_samples=%d samples=%d%s loss_scale=%.6f%s",
+            "n_samples=%d samples=%d%s loss_scale=%.6f",
             self.rollout_id,
             self.rollout_mini_index,
             self.dp_rank,
@@ -1671,7 +1663,6 @@ class StreamingTQIterator:
             window_progress,
             f"/{self.window_quota}" if self.window_quota is not None else "",
             self.loss_scale,
-            adv_info,
         )
         # Warm the controller cache for the next mb while the trainer
         # computes this one (tail prefetch; meta-only).

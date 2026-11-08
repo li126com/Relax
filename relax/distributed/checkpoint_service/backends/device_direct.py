@@ -1037,6 +1037,9 @@ class DeviceDirectBackend(CommBackend):
                 "group_name": self._group_name,
                 "weight_version": str(self.weight_version),
                 "flush_cache": False,
+                # The target receives once; each runner loads its own HF keys,
+                # including the draft's MTP weights and shared embedding/head.
+                "selector": "all",
             }
             # Send weight update to all rollout nodes via Ray actors
             futures = self._batch_request("/update_weights_from_distributed", weight_payload)
@@ -1047,7 +1050,9 @@ class DeviceDirectBackend(CommBackend):
                 handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
             for handle in handles:
                 handle.wait()
-            ray.get(futures)  # Ensure remote update completes
+            for response in ray.get(futures):
+                if isinstance(response, dict) and response.get("success") is False:
+                    raise RuntimeError(f"SGLang rejected distributed weights: {response}")
             completed = True
         finally:
             try:

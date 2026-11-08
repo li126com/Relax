@@ -2,6 +2,7 @@
 
 """Exercise routed IPC error handling without connecting to Ray."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -19,9 +20,11 @@ def module():
 
 
 @pytest.mark.parametrize("failure", [False, True, "exception"])
-def test_routed_ipc_wait_checks_receiver_results(module, failure):
+@pytest.mark.parametrize("routed", [False, True])
+def test_routed_ipc_wait_checks_receiver_results(module, failure, routed):
     updater = object.__new__(module.UpdateWeightFromTensor)
-    updater._route_experts = True
+    updater._route_experts = routed
+    updater._hf_weight_iterator = SimpleNamespace(requires_serial_weight_chunks=True)
     group = object()
     get = (
         Mock(side_effect=RuntimeError("RPC failed"))
@@ -48,9 +51,11 @@ def test_routed_ipc_wait_checks_receiver_results(module, failure):
         assert reduce.call_args.args[0].device.type == "cpu"
 
 
-def test_routed_ipc_empty_rank_propagates_peer_failure(module):
+@pytest.mark.parametrize("routed", [False, True])
+def test_routed_ipc_empty_rank_propagates_peer_failure(module, routed):
     updater = object.__new__(module.UpdateWeightFromTensor)
-    updater._route_experts = True
+    updater._route_experts = routed
+    updater._hf_weight_iterator = SimpleNamespace(requires_serial_weight_chunks=True)
     with (
         patch.object(module.ray, "get") as get,
         patch.object(module, "get_gloo_group"),
@@ -189,9 +194,11 @@ def test_routed_ipc_payload_omits_uncommitted_version(module, version):
         assert kwargs["weight_version"] == "3"
 
 
-def test_routed_ipc_exception_drains_all_readers_before_raising(module):
+@pytest.mark.parametrize("routed", [False, True])
+def test_routed_ipc_exception_drains_all_readers_before_raising(module, routed):
     updater = object.__new__(module.UpdateWeightFromTensor)
-    updater._route_experts = True
+    updater._route_experts = routed
+    updater._hf_weight_iterator = SimpleNamespace(requires_serial_weight_chunks=True)
     calls = []
 
     def get(refs):

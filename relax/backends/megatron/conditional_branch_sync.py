@@ -162,7 +162,9 @@ def _sum_tensors(value: Any) -> torch.Tensor | None:
     return total
 
 
-def _run_dummy_vision(model: torch.nn.Module, device: torch.device) -> torch.Tensor | None:
+def _run_dummy_vision_outputs(
+    model: torch.nn.Module, device: torch.device
+) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
     vision_model = getattr(model, "vision_model", None)
     if vision_model is None:
         return None
@@ -181,7 +183,22 @@ def _run_dummy_vision(model: torch.nn.Module, device: torch.device) -> torch.Ten
     dtype = vision_model.patch_embed.proj.weight.dtype
     dummy_data = torch.zeros((temporal * height * width, feature_dim), device=device, dtype=dtype)
     dummy_grid_thw = torch.tensor([[temporal, height, width]], device=device, dtype=torch.long)
-    return _sum_tensors(vision_model(hidden_states=dummy_data, grid_thw=dummy_grid_thw))
+    return vision_model(hidden_states=dummy_data, grid_thw=dummy_grid_thw)
+
+
+def _run_dummy_vision(model: torch.nn.Module, device: torch.device) -> torch.Tensor | None:
+    return _sum_tensors(_run_dummy_vision_outputs(model, device))
+
+
+def _empty_vision_forward(
+    model: torch.nn.Module, device: torch.device
+) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+    if not model._relax_conditional_branch_sync_active or not torch.is_grad_enabled():
+        return None
+    vision = model.vision_model
+    if not any(parameter.requires_grad for parameter in vision.parameters()):
+        return None
+    return _run_dummy_vision_outputs(model, device)
 
 
 def _attach_zero_dependency(
@@ -214,6 +231,19 @@ def install_conditional_branch_sync(args: argparse.Namespace, model: torch.nn.Mo
 
     original_forward = model.forward
 
+    model._relax_conditional_branch_sync_original_forward = original_forward
+    model._relax_conditional_branch_sync_specs = ("qwen3vl_vision",)
+    model._relax_conditional_branch_sync_installed = True
+    model._relax_conditional_branch_sync_active = True
+
+    if getattr(model, "_relax_empty_vision_forward_supported", False):
+        # Bridge checks the actual input after CP sharding and connects empty
+        # outputs through the same CP collectives as nonempty ranks. Run this
+        # even for all-text microbatches: DDP needs the final microbatch's hooks.
+        model._relax_empty_vision_forward = types.MethodType(_empty_vision_forward, model)
+        _rank0_log_info("Installed Qwen3VL conditional vision branch sync with CP-aware empty-input callback.")
+        return
+
     @functools.wraps(original_forward)
     def wrapped_forward(self, *forward_args, **forward_kwargs):
         if not self._relax_conditional_branch_sync_active:
@@ -228,10 +258,6 @@ def install_conditional_branch_sync(args: argparse.Namespace, model: torch.nn.Mo
             output = _attach_zero_dependency(output, dependency)
         return output
 
-    model._relax_conditional_branch_sync_original_forward = original_forward
-    model._relax_conditional_branch_sync_specs = ("qwen3vl_vision",)
-    model._relax_conditional_branch_sync_installed = True
-    model._relax_conditional_branch_sync_active = True
     model.forward = types.MethodType(wrapped_forward, model)
 
     _rank0_log_info("Installed Qwen3VL conditional vision branch sync.")

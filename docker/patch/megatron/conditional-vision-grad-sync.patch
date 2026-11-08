@@ -1,0 +1,58 @@
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+@@ -290,6 +290,9 @@
+             When we use pipelining, the decoder
+             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
+     """
++
++    # Optional callback for trainable vision branches with empty local input.
++    _relax_empty_vision_forward_supported = True
+ 
+     def __init__(
+         self,
+@@ -719,6 +722,8 @@
+             )
+ 
+             vision_embeds = None
++            vision_zero_dependency = None
++            empty_vision_forward = getattr(self, "_relax_empty_vision_forward", None)
+ 
+             if vision_grid_thw is not None and vision_grid_thw.shape[0] > 0:
+                 if cp_size > 1 and self.config.vision_dp_when_cp:
+@@ -781,6 +786,13 @@
+                                 dtype=self.config.params_dtype,
+                             )
+                         )
++                    if empty_vision_forward is not None:
++                        empty_vision_outputs = empty_vision_forward(vision_data.device)
++                        if empty_vision_outputs is not None:
++                            # Preserve empty shapes while keeping vision backward behind
++                            # the same CP collective as ranks with real vision inputs.
++                            vision_embeds = empty_vision_outputs[0][:0]
++                            deepstack_feature_lists = [features[:0] for features in empty_vision_outputs[1]]
+                 if cp_size > 1 and self.config.vision_dp_when_cp:
+                     ensure_requires_grad_for_cp_collective((vision_embeds, *deepstack_feature_lists))
+                     vision_embeds = AllGatherVisionEmbeddings.apply(
+@@ -794,11 +806,22 @@
+                             seqlen_on_cp_ranks,
+                             self.pg_collection.cp,
+                         )
++            elif empty_vision_forward is not None:
++                empty_vision_outputs = empty_vision_forward(input_ids.device)
++                if empty_vision_outputs is not None:
++                    # Keep every vision output in the graph even when the whole
++                    # microbatch has no images, without changing the LM input.
++                    vision_zero_dependency = sum(
++                        features.float().sum()
++                        for features in (empty_vision_outputs[0], *empty_vision_outputs[1])
++                    ) * 0
+ 
+             combined_embeddings = self.language_model.embedding(
+                 input_ids=input_ids,
+                 position_ids=None,  # NOTE: disable
+             ).clone()  # [text_seq_len, b, h_language]
++            if vision_zero_dependency is not None:
++                combined_embeddings = combined_embeddings + vision_zero_dependency.to(dtype=combined_embeddings.dtype)
+ 
+             if vision_embeds is not None:
+                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()

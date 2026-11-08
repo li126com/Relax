@@ -20,6 +20,8 @@ tar -xzf "$ARCHIVE" -C "$BUILD_DIR/source" --strip-components=1
 cd "$BUILD_DIR/source"
 git apply --check "$PATCH_DIR/v0.3.2-9daabcd-pd-dp-aware.patch"
 git apply "$PATCH_DIR/v0.3.2-9daabcd-pd-dp-aware.patch"
+git apply --check "$PATCH_DIR/tcp-user-timeout.patch"
+git apply "$PATCH_DIR/tcp-user-timeout.patch"
 cp "$PATCH_DIR/v0.3.2-9daabcd-Cargo.lock" bindings/python/Cargo.lock
 
 # Identify the patched wheel independently of an inherited stock/slime wheel.
@@ -43,6 +45,7 @@ record = {
     "source_commit": sys.argv[2],
     "source_archive_sha256": sys.argv[3],
     "patch_sha256": hashlib.sha256((patch_dir / "v0.3.2-9daabcd-pd-dp-aware.patch").read_bytes()).hexdigest(),
+    "tcp_user_timeout_patch_sha256": hashlib.sha256((patch_dir / "tcp-user-timeout.patch").read_bytes()).hexdigest(),
     "cargo_lock_sha256": hashlib.sha256(Path("bindings/python/Cargo.lock").read_bytes()).hexdigest(),
     "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
 }

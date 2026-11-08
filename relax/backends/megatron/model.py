@@ -71,6 +71,7 @@ from .checkpoint import (
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
+from .grad_sync_warmup import warmup_distributed_optimizer_grad_sync, warmup_optimizer_grad_stats
 from .loss import loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
     get_model_provider_func,
@@ -900,6 +901,33 @@ def force_param_sync(model_chunks: Sequence[DDP]) -> None:
         model_chunk.start_param_sync(force_sync=True)
 
 
+def _log_missing_grad_sync(model_chunks: Sequence[DDP], rollout_id: int, step_id: int) -> None:
+    """Report hook metadata on failure without reading gradients or issuing collectives."""
+    try:
+        for chunk_index, chunk in enumerate(model_chunks):
+            names = {id(parameter): name for name, parameter in chunk.named_parameters()}
+            for group_kind in ("bucket_groups", "expert_parallel_bucket_groups"):
+                for group_index, group in enumerate(getattr(chunk, group_kind, ())):
+                    if group.grad_reduce_finished or group.grad_reduce_handle is not None:
+                        continue
+                    ready = group.per_param_grad_ready_counts
+                    golden = group.golden_per_param_grad_ready_counts or {}
+                    missing = [
+                        (names.get(id(parameter), "<unnamed>"), ready.get(parameter, 0), golden.get(parameter))
+                        for parameter in group.params
+                        if parameter not in ready or ready[parameter] != golden.get(parameter)
+                    ]
+                    logger.error(
+                        f"Missing gradient sync: rollout={rollout_id} step={step_id} chunk={chunk_index} "
+                        f"group={group_kind}[{group_index}] first_batch={group.is_first_batch} "
+                        f"ready={len(ready)}/{len(group.params)} missing_count={len(missing)} "
+                        f"missing(name,actual,expected)={missing[:128]}"
+                    )
+    except Exception as error:
+        # Diagnostics must never replace the original synchronization error.
+        logger.warning(f"Could not collect missing-gradient-sync metadata: {error}")
+
+
 def _restore_micro_batch_output_order(values: list, micro_batch_indices: list[list[int]]) -> list:
     """Restore per-sample outputs from packed micro-batch order."""
     origin_indices = sum(micro_batch_indices, [])
@@ -1274,6 +1302,8 @@ def train_one_step(
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
+    warmup_distributed_optimizer_grad_sync(args, model)
+
     if args.custom_megatron_before_train_step_hook_path:
         from relax.utils.misc import load_function
 
@@ -1514,16 +1544,21 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
-    )
+    try:
+        losses_reduced = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+        )
+    except AssertionError as error:
+        if "Communication call has not been issued for this bucket" in str(error):
+            _log_missing_grad_sync(model, rollout_id, step_id)
+        raise
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
@@ -2437,6 +2472,11 @@ def initialize_model_and_optimizer(
         assert loaded_classification_head_param_ids == classification_head_param_ids, (
             "sequence classification head parameter identities changed during checkpoint loading"
         )
+    if role == "actor":
+        from .native_moe_gemm_warmup import warmup_native_moe_linears
+
+        warmup_native_moe_linears(args, model)
+        warmup_optimizer_grad_stats(args, optimizer)
     clear_memory()
 
     return model, optimizer, opt_param_scheduler, iteration

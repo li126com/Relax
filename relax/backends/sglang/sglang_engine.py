@@ -752,6 +752,7 @@ class SGLangEngine(RayActor):
         load_format: str | None = None,
         flush_cache: bool = False,
         weight_version: str | None = None,
+        selector: str | None = None,
     ):
         """Update model weights from tensor data. The HTTP server will only
         post meta data, and the real weights will be copied directly from GPUs.
@@ -766,6 +767,10 @@ class SGLangEngine(RayActor):
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if selector is not None:
+            if selector not in ("target", "draft", "all"):
+                raise ValueError(f"Unsupported weight-update selector: {selector}")
+            payload["selector"] = selector
         return self._make_request(
             "update_weights_from_tensor",
             payload,
@@ -836,6 +841,8 @@ class SGLangEngine(RayActor):
         )
         config = get_hf_config(layout["model_path"])
         text_config = getattr(config, "text_config", None) or config
+        layout["model_type"] = getattr(text_config, "model_type", None) or getattr(config, "model_type", None)
+        layout["supports_weight_update_selector"] = _sglang_has_weight_update_selector()
         if "dtype" in layout:
             from sglang.srt.configs.model_config import _get_and_verify_dtype
 
@@ -1930,6 +1937,24 @@ def _sglang_has_weight_update_session() -> bool:
         # SGLang < 0.5.21 accepts weight loads without an explicit update session.
         # Weight-update sessions were added in 0.5.21 (sgl-project/sglang#40777).
         return False
+    return True
+
+
+@functools.lru_cache(maxsize=None)
+def _sglang_has_weight_update_selector() -> bool:
+    """Require both the all-runner session and per-bucket selector protocol."""
+    try:
+        from sglang.srt.managers.io_struct import BeginWeightUpdateReqInput, UpdateWeightsFromTensorReqInput
+    except ImportError:
+        return False
+    for request_type in (BeginWeightUpdateReqInput, UpdateWeightsFromTensorReqInput):
+        fields = (
+            tuple(field.name for field in dataclasses.fields(request_type))
+            if dataclasses.is_dataclass(request_type)
+            else getattr(request_type, "__struct_fields__", ())
+        )
+        if "selector" not in fields:
+            return False
     return True
 
 

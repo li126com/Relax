@@ -353,16 +353,31 @@ def _post(manager, *, restore=False, quant=True):
     )
 
 
-def _load(manager):
+def _load(manager, *, selector="all", load_format=None):
     return manager.update_weights_from_tensor(
         SimpleNamespace(
             serialized_named_tensors=[],
-            selector="all",
+            selector=selector,
             disable_draft_model=None,
-            load_format=None,
+            load_format=load_format,
             weight_version=None,
         )
     )
+
+
+def test_native_expert_buckets_do_not_replace_eagle_draft_weights(manager):
+    assert manager.begin_weight_update(SimpleNamespace(selector="all")).success
+    assert _load(manager, selector="target", load_format="direct").success
+    assert manager.events.count(("target", "load")) == 1
+    assert manager.events.count(("draft", "load")) == 0
+    # Ordinary HF/MTP buckets inherit the all-runner session, even after a
+    # native target-only bucket. Both models must finish the same update.
+    assert _load(manager, selector=None, load_format="flattened_bucket").success
+    assert manager.events.count(("target", "load")) == 2
+    assert manager.events.count(("draft", "load")) == 1
+    assert manager.end_weight_update(SimpleNamespace()).success
+    assert manager.events.count(("target", "pack")) == 1
+    assert manager.events.count(("draft", "pack")) == 1
 
 
 @pytest.mark.parametrize("protocol", ["mixed"])

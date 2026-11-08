@@ -1,0 +1,32 @@
+--- a/src/app_context.rs
++++ b/src/app_context.rs
+@@ -334,7 +334,8 @@
+             .timeout(Duration::from_secs(timeout_secs))
+             .connect_timeout(Duration::from_secs(10))
+             .tcp_nodelay(true)
+-            .tcp_keepalive(Some(Duration::from_secs(30)));
++            .tcp_keepalive(Some(Duration::from_secs(30)))
++            .tcp_user_timeout(None);
+ 
+         // Force rustls backend when TLS is configured
+         if has_tls_config {
+--- a/src/routers/http/router.rs
++++ b/src/routers/http/router.rs
+@@ -588,7 +588,7 @@
+             Ok(res) => res,
+             Err(e) => {
+                 error!(
+-                    "Failed to send typed request worker_url={} route={} error={}",
++                    "Failed to send typed request worker_url={} route={} error={:?}",
+                     worker_url, route, e
+                 );
+ 
+@@ -686,7 +686,7 @@
+         .url()
+         .map(|u| u.to_string())
+         .unwrap_or_else(|| "unknown".to_string());
+-    let message = format!("{}. URL: {}", e, url);
++    let message = format!("{:?}. URL: {}", e, url);
+ 
+     // TODO improve error status code
+     let (status, code) = if let Some(upstream_status) = e.status() {

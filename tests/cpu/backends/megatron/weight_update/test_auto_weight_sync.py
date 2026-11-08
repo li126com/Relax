@@ -276,6 +276,96 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
     assert set(completed) == set(alive)
 
 
+@pytest.mark.parametrize("failure", [None, "dispatch", "ack"])
+def test_pipeline_experts_release_storage_after_ack_before_next_allocation(monkeypatch, failure):
+    import weakref
+
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    from relax.backends.megatron.weight_update.expert_layout import direct_expert_chunk
+
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
+    updater.quantization_config = None
+    updater.weight_version = 0
+    updater.rollout_engines = updater.distributed_rollout_engines = []
+    updater.weights_getter = lambda: {}
+    iterator = HfWeightIteratorBridge.__new__(HfWeightIteratorBridge)
+    iterator.args = SimpleNamespace(update_weight_buffer_size=1024)
+    iterator._bf16_expert_buckets = [object()]
+    iterator._packed_expert_sync = True
+    iterator._pipeline_expert_groups = ((0, 1), (2, 3))
+    iterator._packed_expert_names = frozenset()
+    layout = DirectExpertLayout(4, 6, 4, 2, ep_size=2)
+    storages, views, completed, allocated = {}, {}, [], []
+    failed_once = False
+
+    def allocate(name):
+        for previous, storage in storages.items():
+            assert previous in completed, "Next packed allocation preceded the previous IPC acknowledgment"
+            assert storage.expired(), "A small IPC shard still retains the previous full packed allocation"
+        tensor = torch.arange(4 * 8 * 6, dtype=torch.bfloat16).reshape(4, 8, 6)
+        storages[name] = StorageWeakRef(tensor.untyped_storage())
+        allocated.append(name)
+        return tensor
+
+    def dense(weights, **kwargs):
+        # The final ordinary HF chunk must also be gone before packed export.
+        tensor = allocate("dense")
+        yield "model.norm.weight", tensor
+        del tensor
+
+    def experts(weights):
+        for layer in range(2):
+            tensor = allocate(f"expert{layer}")
+            yield [(f"model.layers.{layer}.mlp.experts.gate_up_proj", tensor)]
+            del tensor
+
+    def send(tensors, *, dispatch_errors):
+        key = allocated[-1]
+        native = direct_expert_chunk(tensors, layout, tp_rank=0)
+        view = native[0][1] if native is not None else tensors[0][1][:1]
+        assert view.untyped_storage().nbytes() > view.nbytes
+        views[key] = weakref.ref(view)
+        if key == "expert0" and failure == "dispatch":
+            dispatch_errors.append("injected dispatch failure")
+        return [key], [view]
+
+    def get(refs):
+        nonlocal failed_once
+        names = refs if isinstance(refs, list) else [refs]
+        for name in names:
+            assert not storages[name].expired(), "Released storage before the remote reader completed"
+            assert views[name]() is not None
+        if failure == "ack" and refs == ["expert0"] and not failed_once:
+            failed_once = True
+            raise RuntimeError("injected acknowledgment failure")
+        completed.extend(names)
+        return [{} for _ in names] if isinstance(refs, list) else {}
+
+    iterator._iter_hf_params = dense
+    iterator._iter_bf16_expert_chunks = experts
+    updater._hf_weight_iterator = iterator
+    updater._send_hf_params = send
+    monkeypatch.setattr(sync.ray, "get", get)
+    monkeypatch.setattr(sync.dist, "get_rank", lambda **kwargs: 0)
+    monkeypatch.setattr(sync.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(sync.dist, "barrier", lambda **kwargs: None)
+    monkeypatch.setattr(sync.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sync.dist, "all_gather_object", lambda output, value, **kwargs: output.__setitem__(0, value))
+    monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(sync.device_utils, "maybe_backend_barrier_on_weight_chunk", lambda **kwargs: None)
+    if failure is None:
+        updater.update_weights()
+        assert allocated == ["dense", "expert0", "expert1"]
+        assert all(storage.expired() for storage in storages.values())
+    else:
+        with pytest.raises(RuntimeError, match="injected"):
+            updater.update_weights()
+        assert allocated == ["dense", "expert0"]
+    assert set(completed) == set(allocated)
+
+
 @pytest.mark.parametrize("kind", ["replicated", "duplicated", "buffer", "sharded"])
 def test_auto_async_plan_reads_gdn_config_only_for_sharded_parameters(monkeypatch, kind):
     from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
@@ -324,3 +414,128 @@ def test_expert_eligibility_uses_full_buffer_instead_of_per_owner_quota(monkeypa
     monkeypatch.setattr(bridge.dist, "get_process_group_ranks", lambda group: list(range(16)))
     iterator = HfWeightIteratorBridge(SimpleNamespace(update_weight_buffer_size=512 * 1024**2), [], "any-model", None)
     assert (iterator._bf16_expert_buckets is not None) is enabled
+
+
+def test_pipeline_packing_uses_real_stage_owners_and_preserves_hf_fallback(monkeypatch):
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+    from relax.backends.megatron.weight_update.expert_gather import PipelineExpertGather
+
+    groups = ((7, 2), (11, 5))
+    infos = [
+        SimpleNamespace(
+            name=f"decoder.layers.{layer}.mlp.experts.linear_fc{fc}.weight{expert}",
+            dtype=torch.bfloat16,
+            shape=shape,
+            src_rank=groups[stage][expert // 2],
+            size=shape[0] * shape[1] * 2,
+        )
+        for stage, layers in enumerate(((0, 1), (2,)))
+        for layer in layers
+        for fc, shape in ((1, (16, 6)), (2, (6, 8)))
+        for expert in range(4)
+    ]
+    iterator = HfWeightIteratorBridge.__new__(HfWeightIteratorBridge)
+    iterator.args = SimpleNamespace(num_experts=4, update_weight_buffer_size=256)
+    iterator._packed_expert_sync = False
+    iterator._direct_expert_layout = None
+    iterator._pipeline_expert_groups = groups
+    iterator._bf16_expert_buckets = [infos]
+    iterator._bridge_converter = SimpleNamespace(supports_packed_experts=lambda names: True)
+    monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_group", lambda: "ep")
+    monkeypatch.setattr(bridge.dist, "get_process_group_ranks", lambda group: groups[1])
+    layout = DirectExpertLayout(4, 6, 8, 2, ep_size=2, supports_expert_slices=True, target_only=True)
+    assert iterator.configure_direct_experts(layout)
+    assert iterator._packed_expert_names == {info.name for info in infos}
+    for bucket, gather in zip(iterator._bf16_expert_buckets, iterator._bf16_expert_gathers, strict=True):
+        assert isinstance(gather, PipelineExpertGather)
+        assert all(info.src_rank in groups[gather._source_stage] for info in bucket)
+        assert sum(info.size for info in bucket) <= iterator.args.update_weight_buffer_size
+    # Reconnection can reject a receiver; PP must fall back to the complete
+    # original HF stream, not a local-stage-only BF16 gather.
+    assert not iterator.configure_direct_experts(None)
+    calls = []
+
+    def hf(weights, **kwargs):
+        calls.append(kwargs)
+        yield "model.layers.0.weight", torch.ones(1)
+
+    iterator._iter_hf_params = hf
+    iterator._expert_router = None
+    assert list(iterator.get_hf_weight_chunks({}))
+    assert calls == [{"include_experts": True}]
+    assert iterator.configure_direct_experts(layout)
+
+
+def test_native_main_experts_do_not_drop_mtp_experts(monkeypatch):
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+
+    main = "decoder.layers.0.mlp.experts.linear_fc1.weight0"
+    mtp = "mtp.layers.0.transformer_layer.mlp.experts.linear_fc1.weight0"
+    infos = [
+        SimpleNamespace(name=name, src_rank=0, shape=(2, 2), dtype=torch.bfloat16, attrs={}) for name in (main, mtp)
+    ]
+    iterator = HfWeightIteratorBridge.__new__(HfWeightIteratorBridge)
+    iterator.args = SimpleNamespace(update_weight_buffer_size=256)
+    iterator.lora_merge_mode = False
+    iterator._expert_buckets = [infos]
+    iterator._expert_broadcast_caches = [({}, {})]
+    iterator._non_expert_buckets = []
+    iterator._vanilla_key_map = {main: main, mtp: mtp}
+    iterator._bf16_expert_buckets = [[infos[0]]]
+    iterator._packed_expert_sync = True
+    iterator._packed_expert_names = frozenset([main])
+    iterator._pipeline_expert_groups = ((0, 1), (2, 3))
+    iterator._bridge_converter = SimpleNamespace(
+        init_tasks=lambda: None,
+        broadcast_and_apply_configs=lambda: None,
+        convert=lambda name, tensor: [(name, tensor)],
+    )
+    iterator._iter_bf16_expert_chunks = lambda weights: iter([[("native-main", weights[main])]])
+    monkeypatch.setattr(bridge.dist, "get_rank", lambda **kwargs: 0)
+    monkeypatch.setattr(bridge.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(bridge.device_module, "synchronize", lambda: None)
+    monkeypatch.setattr(bridge.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge, "all_gather_param", lambda args, name, tensor: tensor)
+    weights = {main: torch.full((2, 2), 3.0), mtp: torch.full((2, 2), 7.0)}
+    actual = [item for chunk in iterator.get_hf_weight_chunks(weights) for item in chunk]
+    assert [name for name, _ in actual] == [mtp, "native-main"]
+    torch.testing.assert_close(actual[0][1], weights[mtp])
+    torch.testing.assert_close(actual[1][1], weights[main])
+
+
+def test_pipeline_metadata_recovers_real_owners_instead_of_relay_ranks(monkeypatch):
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+    from relax.utils.types import ParamInfo
+
+    def info(name, owner):
+        return ParamInfo(name=name, src_rank=owner, shape=(2, 2), dtype=torch.bfloat16, size=8, attrs={})
+
+    original = [info("decoder.layers.0.experts.a", 2), info("mtp.layers.0.experts.a", 2)]
+    own = info(original[0].name, 7)
+    other_stage = info("decoder.layers.1.experts.a", 11)
+    other_lane = [info("decoder.layers.0.experts.b", 2), info("decoder.layers.1.experts.b", 5)]
+    monkeypatch.setattr(bridge.mpu, "get_pipeline_model_parallel_group", lambda: "pp")
+    monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_group", lambda: "ep")
+    monkeypatch.setattr(bridge.dist, "get_rank", lambda **kwargs: 7)
+    monkeypatch.setattr(bridge.dist, "get_world_size", lambda **kwargs: 2)
+    monkeypatch.setattr(bridge.dist, "get_process_group_ranks", lambda group: [7, 2])
+    calls = []
+
+    def exchange(output, local, *, group):
+        calls.append(group)
+        if len(calls) == 1:
+            assert local == (7, 2)
+            output[:] = [(7, 2), (11, 5)]
+        elif len(calls) == 2:
+            assert local == [own]
+            output[:] = [local, [other_stage]]
+        else:
+            assert local == [own, other_stage]
+            output[:] = [local, other_lane]
+
+    monkeypatch.setattr(bridge.dist, "all_gather_object", exchange)
+    actual, groups = bridge._pipeline_expert_metadata(original, {i.name: i.name for i in original})
+    assert groups == ((7, 2), (11, 5))
+    assert calls == ["pp", "pp", "ep"]
+    assert {i.name: i.src_rank for i in actual} == {i.name: i.src_rank for i in [own, other_stage, *other_lane]}

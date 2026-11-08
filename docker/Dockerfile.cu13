@@ -325,12 +325,13 @@ RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-trans
     TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
 
-# Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
+# Install the R3 + PD DP-aware router with the TCP timeout fix, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
     python -c "import json, importlib.resources as r, sglang_router; from sglang_router import sglang_router_rs; \
         b = json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()); \
         assert sglang_router.__version__ == b['version'] == '0.3.2+slime.dpaware'; \
+        assert b.get('tcp_user_timeout_patch_sha256') == '75593365aec7d349d3616b45efa1ef72155970ed5e02ce6b8f4f9d7288cf3211'; \
         assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)" && \
     rm -rf /tmp/router-wheels
 
@@ -342,6 +343,7 @@ COPY docker/patch/${PATCH_VERSION}/megatron.patch \
     docker/patch/megatron/20261020-qwen35-optimized.patch \
     docker/patch/megatron/20261020-model-operators.patch \
     docker/patch/megatron/mtp-cp-normalization.patch \
+    docker/patch/megatron/conditional-vision-grad-sync.patch \
     docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
@@ -357,13 +359,14 @@ RUN cd Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
     patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
+    patch --batch --forward --fuzz=0 -p1 < conditional-vision-grad-sync.patch && \
     echo 'e8cbb2b2a895154622678516a6f67ef47e4b934dc7dc196115cd56a6cea235e6  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
     patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \
     echo 'e88edbe5c69536a4dcfdd9bf6e24d79634d1058ccdd62660bab5ae0b48ae7f76  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch kimi-packed-sequence-api.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch kimi-packed-sequence-api.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch conditional-vision-grad-sync.patch && \
     apt-get update && apt-get install -y --no-install-recommends jq && \
     rm -rf /var/lib/apt/lists/*
 

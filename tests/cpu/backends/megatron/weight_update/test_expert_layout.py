@@ -7,6 +7,7 @@ import torch
 
 from relax.backends.megatron.weight_update.expert_layout import DirectExpertLayout, direct_expert_chunk
 from relax.backends.megatron.weight_update.ipc import dispatch_typed_buckets
+from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
 
 
 # Receiver-rank order from SGLang's [MoE DP, EP, MoE TP] process groups.
@@ -130,6 +131,33 @@ def test_resolved_receiver_geometry_has_no_model_family_requirement(tp):
     assert DirectExpertLayout.from_receiver(receiver(tp_size=tp)) == DirectExpertLayout(4, 6, 8, tp)
 
 
+@pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5_moe_text"])
+def test_qwen_eagle_native_experts_are_target_only(model_type):
+    config = receiver(speculative_algorithm="EAGLE", model_type=model_type, supports_weight_update_selector=True)
+    layout = DirectExpertLayout.from_receiver(config)
+    assert layout.target_only
+    assert layout != DirectExpertLayout.from_receiver(receiver())
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        dict(supports_weight_update_selector=False),
+        dict(supports_weight_update_selector=None),
+        dict(model_type=None),
+        dict(model_type="deepseek_v3"),
+        dict(speculative_algorithm="EAGLE3"),
+        dict(speculative_algorithm="NEXTN"),
+    ],
+)
+def test_speculative_direct_experts_reject_unverified_receiver(override):
+    config = receiver(
+        speculative_algorithm="EAGLE", model_type="qwen3_5_moe_text", supports_weight_update_selector=True
+    )
+    with pytest.raises(ValueError, match="target/draft weight selectors"):
+        DirectExpertLayout.from_receiver(config | override)
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -217,13 +245,18 @@ def test_receiver_layout_agreement_includes_gate_up_order():
         ([[("direct", "d0")], []], ["direct"]),
         ([[("direct", "d0")], [("flattened_bucket", "f1")]], ["direct", "flattened_bucket"]),
         (
+            [[(EXPERT_SLICE_LOADER, "s0"), ("flattened_bucket", "f0")], []],
+            [EXPERT_SLICE_LOADER, "flattened_bucket"],
+        ),
+        (
             [[("flattened_bucket", "f0"), ("flattened_bucket", "g0")], [], [("direct", "d2")], []],
             ["flattened_bucket", "direct", "flattened_bucket"],
         ),
         ([[], []], []),
     ],
 )
-def test_format_dispatch_handles_empty_and_uneven_ranks(packets, formats):
+@pytest.mark.parametrize("native_target_only", [False, True])
+def test_format_dispatch_handles_empty_and_uneven_ranks(packets, formats, native_target_only):
     calls, held = [], []
     serializer = SimpleNamespace(
         serialize=lambda value, output_str: "empty-direct" if isinstance(value, list) else "empty-flat"
@@ -240,11 +273,17 @@ def test_format_dispatch_handles_empty_and_uneven_ranks(packets, formats):
         serializer=serializer,
         empty_flattened=lambda: dict(flattened_tensor=torch.empty(0, dtype=torch.uint8), metadata=[]),
         held=held,
+        native_target_only=native_target_only,
     )
     assert len(refs) == len(formats) and [call["load_format"] for call in calls] == formats
     assert all(
         len(call["serialized_named_tensors"]) == len(packets) and call["weight_version"] == "12" for call in calls
     )
+    for call in calls:
+        if native_target_only and call["load_format"] in ("direct", EXPERT_SLICE_LOADER):
+            assert call["selector"] == "target"
+        else:
+            assert "selector" not in call
 
 
 def test_dispatch_validates_all_formats_before_sending_and_retains_partial_refs():

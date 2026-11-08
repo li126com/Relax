@@ -260,3 +260,112 @@ def test_owner_balanced_ranges_share_one_storage_and_one_collective(module, monk
     for (name, tensor), peer, (start, end) in zip(actual, inputs, ranges, strict=True):
         assert name.endswith(f".{projection}_proj[{start}:{end}]")
         assert torch.equal(tensor.flatten(), flattened(peer, projection))
+
+
+def _pipeline_packed_gloo_worker(rank: int, rendezvous: str) -> None:
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as distributed
+
+    from relax.backends.megatron.weight_update.expert_gather import PackedExpertGather, PipelineExpertGather
+
+    torch.set_num_threads(1)
+    distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60)
+    )
+    try:
+        ranges = [(2, 5), (15, 18)]
+        # Interleaved global ranks and unequal PP layer counts prevent an
+        # implementation from relying on rank strides or equal layer splits.
+        specs = [
+            (0, 0, "gate_up", None),
+            (0, 0, "down", ranges),
+            (1, 1, "gate_up", ranges),
+            (1, 1, "down", None),
+            (1, 2, "gate_up", None),
+            (1, 2, "down", ranges),
+        ]
+        plans = [
+            PipelineExpertGather(PackedExpertGather(24, expert_ranges=ranges), stage) for stage, _, _, ranges in specs
+        ]
+        previous = {}
+        for step in range(2):
+            # New group objects with the same topology emulate train offload
+            # and reload; cached plans must use the supplied live groups.
+            pp_groups = [distributed.new_group(ranks) for ranks in ([0, 1], [2, 3])]
+            ep_groups = [distributed.new_group(ranks) for ranks in ([0, 2], [1, 3])]
+            pp, ep = pp_groups[rank // 2], ep_groups[rank % 2]
+            with (
+                patch.object(
+                    distributed, "broadcast_object_list", wraps=distributed.broadcast_object_list
+                ) as metadata,
+                patch.object(distributed, "broadcast", wraps=distributed.broadcast) as payload,
+            ):
+                for index, ((stage, layer, projection, ranges), plan) in enumerate(zip(specs, plans, strict=True)):
+                    inputs = peers(projection)
+                    for peer in inputs:
+                        for _, tensor in peer:
+                            tensor.add_(step * 16 + layer * 8)
+                    if ranges is not None:
+                        inputs = [
+                            [
+                                (name, tensor)
+                                for name, tensor in peer
+                                if start <= int(name.split(".experts.")[1].split(".")[0]) < end
+                            ]
+                            for peer, (start, end) in zip(inputs, ranges, strict=True)
+                        ]
+                    expected = torch.cat([flattened(peer, projection) for peer in inputs])
+                    local = (
+                        [(name.replace("layers.2.", f"layers.{layer}."), tensor) for name, tensor in inputs[rank // 2]]
+                        if rank % 2 == stage
+                        else []
+                    )
+                    actual = plan(local, group=ep, pipeline_group=pp, device=torch.device("cpu"))
+                    torch.testing.assert_close(torch.cat([value.flatten() for _, value in actual]), expected)
+                    prefix = f"model.language_model.layers.{layer}.mlp.experts.{projection}_proj"
+                    expected_names = (
+                        [prefix] if ranges is None else [f"{prefix}[{start}:{end}]" for start, end in ranges]
+                    )
+                    assert [name for name, _ in actual] == expected_names
+                    assert len({value.untyped_storage().data_ptr() for _, value in actual}) == 1
+                    if index in previous:
+                        for old, saved in previous[index]:
+                            torch.testing.assert_close(old, saved)
+                        assert not torch.equal(actual[0][1], previous[index][0][1])
+                    previous[index] = [(value, value.clone()) for _, value in actual]
+                assert metadata.call_count == (len(specs) if step == 0 else 0)
+                assert payload.call_count == len(specs), "Each PP lane must broadcast one buffer, not one per range"
+            distributed.barrier()
+            distributed.destroy_process_group(pp)
+            distributed.destroy_process_group(ep)
+
+        def check_metadata(value):
+            assert not isinstance(value, (torch.Tensor, distributed.ProcessGroup))
+            if isinstance(value, dict):
+                for item in value.values():
+                    check_metadata(item)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    check_metadata(item)
+
+        for plan in plans:
+            check_metadata({key: value for key, value in vars(plan).items() if key != "_gather"})
+            check_metadata(vars(plan._gather))
+    finally:
+        distributed.destroy_process_group()
+
+
+def test_pipeline_packed_experts_values_and_reloaded_groups(tmp_path, monkeypatch):
+    import torch.multiprocessing as multiprocessing
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    monkeypatch.setenv("MKL_NUM_THREADS", "1")
+    multiprocessing.start_processes(
+        _pipeline_packed_gloo_worker,
+        args=((tmp_path / "pipeline-experts").as_uri(),),
+        nprocs=4,
+        join=True,
+        start_method="spawn",
+    )

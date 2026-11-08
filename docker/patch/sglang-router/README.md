@@ -16,11 +16,16 @@ decode. Raw native fields, including R3 `routed_experts`, remain intact. The
 paired SGLang patch also accepts the legacy `data_parallel_rank` field used by
 this router's regular path; an explicit `routed_dp_rank` takes precedence.
 
+`tcp-user-timeout.patch` is applied after the PD/DP patch. It clears the router's
+explicit TCP user timeout while retaining TCP keepalive and the configured HTTP
+request timeout. This prevents that extra socket timeout from shortening
+keepalive handling, and includes underlying request errors in failure logs.
+
 ## Image build
 
 The `router_builder` stage uses the same `TRAIN_IMAGE` as the final image,
 including when an external training image is supplied. It installs Rust 1.97.1
-and maturin 1.9.6, verifies the pinned source archive, applies the router patch,
+and maturin 1.9.6, verifies the pinned source archive, applies both router patches,
 and builds a wheel with the checked-in Cargo lockfile and `--locked`. Rust and
 build-only dependencies remain in the builder stage. `ROUTER_BUILD_JOBS`
 (default: 16) controls build parallelism.
@@ -28,8 +33,9 @@ build-only dependencies remain in the builder stage. `ROUTER_BUILD_JOBS`
 The final image installs the wheel after Python requirements, replacing any
 inherited stock router. Its version is `0.3.2+slime.dpaware`. The packaged
 `sglang_router/_relax_build.json` records the source commit, archive checksum,
-patch checksum, lockfile checksum and Rust version. The image build verifies
-that the native extension imports and the expected patched version is loaded.
+PD/DP patch checksum, TCP timeout patch checksum, lockfile checksum and Rust
+version. The image build verifies that the native extension imports, the expected
+patched version is loaded, and `tcp_user_timeout_patch_sha256` matches the TCP fix.
 
 ## Build an isolated wheel
 

@@ -1026,11 +1026,18 @@ async def generate_rollout_async(
             return total_transfer_samples >= target_data_size
         return len(data) >= target_data_size and total_transfer_samples >= num_old_samples
 
-    # Outer loop stops once we've COMMITTED target_data_size groups; inner loop tops up
-    # submissions whenever in-flight admitted groups drop below the commit target, each
-    # round admitting a full over_sampling_batch_size so the surplus absorbs aborts.
+    def needs_more_tasks() -> bool:
+        if not args.fully_async or strict_fill_current or is_final_backfill:
+            return state.remaining_batch_size < submit_target
+        # Aborts count toward the current phase's result quota, but not old debt.
+        # Include finished tasks not yet consumed by the loop, and protected tasks.
+        needed = max(target_data_size - len(data), num_old_samples - total_transfer_samples, 0)
+        return len(state.pendings | state.protected_pendings) < needed
+
+    # Keep the full over-sampling fetch size, but only top up when pending groups
+    # cannot cover the remaining result quota and required previous-step backfill.
     while not target_reached():
-        while state.remaining_batch_size < submit_target:
+        while needs_more_tasks():
             _t_get_samples = monotonic()
 
             if state.prefetched_samples_ref is not None:

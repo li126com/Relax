@@ -93,6 +93,7 @@ def expert_sync_engine_module(monkeypatch, sglang_engine_module):
     misc.get_hf_config = Mock()
     monkeypatch.setitem(sys.modules, misc.__name__, misc)
     monkeypatch.setattr(relax.utils, "misc", misc, raising=False)
+    monkeypatch.setattr(sglang_engine_module, "_sglang_has_weight_update_selector", lambda: False)
     return sglang_engine_module
 
 
@@ -141,17 +142,64 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
         "custom_weight_loader": ["relax.backends.sglang.weight_loader.load_expert_slices"],
     }
     get = Mock(return_value=response)
-    config = Mock(return_value=SimpleNamespace(text_config=SimpleNamespace(num_experts=896)))
+    config = Mock(
+        return_value=SimpleNamespace(text_config=SimpleNamespace(num_experts=896, model_type="qwen3_5_moe_text"))
+    )
     monkeypatch.setattr(module.requests, "get", get)
     monkeypatch.setattr(misc, "get_hf_config", config)
+    monkeypatch.setattr(module, "_sglang_has_weight_update_selector", lambda: True)
     result = engine.get_expert_weight_sync_layout()
     assert result["enable_eplb"] is True
     assert result["num_experts"] == 896
+    assert result["model_type"] == "qwen3_5_moe_text"
+    assert result["supports_weight_update_selector"] is True
     assert result["custom_weight_loader"] == ["relax.backends.sglang.weight_loader.load_expert_slices"]
     assert "ignored_server_field" not in result
     config.assert_called_once_with("/test/runtime-model")
     get.assert_called_once_with("http://localhost:1234/server_info", timeout=30)
     response.raise_for_status.assert_called_once()
+
+
+@pytest.mark.parametrize("selector", [None, "target", "draft", "all"])
+def test_tensor_weight_update_preserves_runner_selector(monkeypatch, sglang_engine_module, selector):
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
+    request = Mock(return_value={"success": True})
+    monkeypatch.setattr(engine, "_make_request", request)
+    engine.update_weights_from_tensor(["tensor"], load_format="direct", weight_version="2", selector=selector)
+    payload = request.call_args.args[1]
+    assert request.call_args.args[0] == "update_weights_from_tensor"
+    if selector is None:
+        assert "selector" not in payload
+    else:
+        assert payload["selector"] == selector
+    assert payload["serialized_named_tensors"] == ["tensor"] and payload["weight_version"] == "2"
+
+
+@pytest.mark.parametrize("session_selector,bucket_selector", [(True, True), (True, False), (False, True)])
+@pytest.mark.parametrize("struct_kind", ["dataclass", "msgspec"])
+def test_weight_selector_capability_requires_both_protocol_fields(
+    monkeypatch, sglang_engine_module, session_selector, bucket_selector, struct_kind
+):
+    module = sglang_engine_module
+    io_struct = ModuleType("sglang.srt.managers.io_struct")
+    for name, has_selector in (
+        ("BeginWeightUpdateReqInput", session_selector),
+        ("UpdateWeightsFromTensorReqInput", bucket_selector),
+    ):
+        fields = [("selector", str, "all")] if has_selector else []
+        if struct_kind == "dataclass":
+            request_type = make_dataclass(name, fields)
+        else:
+            import msgspec
+
+            request_type = msgspec.defstruct(name, fields)
+        setattr(io_struct, name, request_type)
+    monkeypatch.setitem(sys.modules, io_struct.__name__, io_struct)
+    module._sglang_has_weight_update_selector.cache_clear()
+    try:
+        assert module._sglang_has_weight_update_selector() is (session_selector and bucket_selector)
+    finally:
+        module._sglang_has_weight_update_selector.cache_clear()
 
 
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):

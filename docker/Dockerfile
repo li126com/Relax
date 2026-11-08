@@ -215,12 +215,13 @@ RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path
     python -m compileall -q fla/modules/conv/triton && \
     rm /tmp/fla-output-config.patch /tmp/fla-conv-entries.patch
 
-# Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
+# Install the R3 + PD DP-aware router with the TCP timeout fix, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
     python -c "import json, importlib.resources as r, sglang_router; from sglang_router import sglang_router_rs; \
         b = json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()); \
         assert sglang_router.__version__ == b['version'] == '0.3.2+slime.dpaware'; \
+        assert b.get('tcp_user_timeout_patch_sha256') == '75593365aec7d349d3616b45efa1ef72155970ed5e02ce6b8f4f9d7288cf3211'; \
         assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)" && \
     rm -rf /tmp/router-wheels
 
@@ -231,6 +232,7 @@ COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
 COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
+COPY docker/patch/megatron/conditional-vision-grad-sync.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
@@ -242,10 +244,11 @@ RUN cd Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
     patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
+    patch --batch --forward --fuzz=0 -p1 < conditional-vision-grad-sync.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch conditional-vision-grad-sync.patch 20261020-qwen35-optimized.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 

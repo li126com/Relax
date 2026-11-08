@@ -303,6 +303,117 @@ async def test_final_backfill_replenishes_aborted_groups(monkeypatch):
     ]
 
 
+@pytest.mark.asyncio
+async def test_early_weight_sync_abort_does_not_resubmit_sufficient_pending_groups(monkeypatch):
+    state = _RolloutState(last_step_current_deficit=0)
+    groups = [[Sample(index=i, status=Sample.Status.ABORTED if i == 0 else Sample.Status.COMPLETED)] for i in range(4)]
+    release = asyncio.Event()
+    created_tasks, requests, transfers = [], [], []
+
+    async def finish_group(group):
+        if group[0].status != Sample.Status.ABORTED:
+            await release.wait()
+        return group
+
+    def submit(samples):
+        state.remaining_batch_size += len(samples)
+        for group in samples:
+            task = asyncio.create_task(finish_group(group))
+            created_tasks.append(task)
+            pending = state.protected_pendings if group[0].index == 3 else state.pendings
+            pending.add(task)
+
+    def get_samples(count):
+        requests.append(count)
+        assert len(requests) == 1, "The first batch already covers the non-strict phase quota"
+        return groups
+
+    async def transfer(_args, batch, _count, rollout_id, _client, *, is_last=False):
+        transfers.append((rollout_id, is_last, {group[0].index for group in batch}))
+
+    async def release_after_abort_is_consumed():
+        while groups[0][0].abort_count == 0:
+            await asyncio.sleep(0)
+        release.set()
+
+    _patch_rollout(monkeypatch, state, transfer)
+    monkeypatch.setattr(state, "submit_generate_tasks", submit)
+    releaser = asyncio.create_task(release_after_abort_is_consumed())
+    try:
+        result, carry = await asyncio.wait_for(
+            sglang_rollout.generate_rollout_async(
+                _rollout_args(
+                    max_staleness=1,
+                    num_rollout=3,
+                    rollout_batch_size=4,
+                    over_sampling_batch_size=4,
+                    global_batch_size=4,
+                ),
+                rollout_id=0,
+                data_source=SimpleNamespace(get_samples=SimpleNamespace(remote=get_samples)),
+                data_system_client=None,
+            ),
+            timeout=2,
+        )
+    finally:
+        release.set()
+        releaser.cancel()
+        await asyncio.gather(releaser, *created_tasks, return_exceptions=True)
+
+    assert requests == [4]
+    assert len(result.samples) == 4
+    assert transfers == [(0, False, {1, 2, 3})]
+    assert carry == [groups[0]] and groups[0][0].abort_count == 1
+    assert state.last_step_current_deficit == 1
+    assert not state.pendings and not state.protected_pendings
+
+
+@pytest.mark.asyncio
+async def test_non_strict_rollout_replenishes_old_debt_after_all_groups_abort(monkeypatch):
+    state = _RolloutState(last_step_current_deficit=2)
+    aborted = [[Sample(index=i, status=Sample.Status.ABORTED)] for i in range(6)]
+    completed = [[Sample(index=i, status=Sample.Status.COMPLETED)] for i in range(6, 12)]
+    batches = [aborted, completed]
+    requests, transfers = [], []
+
+    def get_samples(count):
+        requests.append(count)
+        return batches.pop(0)
+
+    async def transfer(_args, batch, _count, rollout_id, _client, *, is_last=False):
+        transfers.append((rollout_id, is_last, {group[0].index for group in batch}))
+
+    _patch_rollout(monkeypatch, state, transfer)
+    result, carry = await asyncio.wait_for(
+        sglang_rollout.generate_rollout_async(
+            _rollout_args(
+                max_staleness=1,
+                num_rollout=3,
+                rollout_batch_size=4,
+                over_sampling_batch_size=4,
+                global_batch_size=4,
+            ),
+            rollout_id=1,
+            data_source=SimpleNamespace(get_samples=SimpleNamespace(remote=get_samples)),
+            data_system_client=None,
+        ),
+        timeout=2,
+    )
+
+    assert requests == [6, 6]
+    assert len(result.samples) == 6
+    assert len(transfers) == 1 and transfers[0][:2] == (0, True)
+    committed = transfers[0][2]
+    assert len(committed) == 2
+    carried_aborts = [group[0] for group in carry if group[0].status == Sample.Status.ABORTED]
+    assert {sample.index for sample in carried_aborts} == set(range(6))
+    assert all(sample.abort_count == 1 for sample in carried_aborts)
+    surplus = {group[0].index for group in carry if group[0].status == Sample.Status.COMPLETED}
+    assert len(surplus) == 4 and committed.isdisjoint(surplus) and committed | surplus == set(range(6, 12))
+    assert state.last_step_current_deficit == 4
+    assert not state.pendings and not state.protected_pendings
+
+
 @pytest.mark.parametrize(("max_staleness", "expected_requests", "expected_deficit"), [(2, 1, 8), (0, 2, 0)])
 @pytest.mark.asyncio
 async def test_old_partition_is_paid_before_current(monkeypatch, max_staleness, expected_requests, expected_deficit):

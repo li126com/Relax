@@ -34,6 +34,7 @@ class DirectExpertLayout:
     ep_size: int = 1
     moe_dp_size: int = 1
     supports_expert_slices: bool = False
+    target_only: bool = False
 
     def __post_init__(self) -> None:
         dimensions = (
@@ -71,6 +72,14 @@ class DirectExpertLayout:
             raise ValueError("Unsupported direct expert runner layout")
         if config.get("is_cuda") is not True:
             raise ValueError("Direct BF16 experts require a verified NVIDIA CUDA receiver")
+        speculative_algorithm = config.get("speculative_algorithm")
+        target_only = speculative_algorithm is not None
+        if target_only and not (
+            speculative_algorithm == "EAGLE"
+            and config.get("model_type") in ("qwen3_5_moe", "qwen3_5_moe_text")
+            and config.get("supports_weight_update_selector") is True
+        ):
+            raise ValueError("Speculative direct experts require Qwen3.5 MoE EAGLE and target/draft weight selectors")
         # A2A dispatches activations; it does not change these runners' BF16
         # weight layout. SGLang validates runner/dispatcher compatibility.
         if (
@@ -84,7 +93,6 @@ class DirectExpertLayout:
             or config.get("quantization_config")
             or config.get("enable_lora")
             or config.get("kt_weight_path")
-            or config.get("speculative_algorithm") is not None
             or config.get("enforce_shared_experts_fusion")
             or json.loads(config.get("json_model_override_args") or "{}")
         ):
@@ -98,6 +106,7 @@ class DirectExpertLayout:
             ep_size=config.get("ep_size"),
             moe_dp_size=config.get("moe_dp_size"),
             supports_expert_slices=EXPERT_SLICE_LOADER in (config.get("custom_weight_loader") or []),
+            target_only=target_only,
         )
 
     def shard(

@@ -126,3 +126,48 @@ def test_contiguous_allgather_layout_is_preserved_without_bridge_metadata(monkey
     assert chunks[0][0].numel() == 0
     assert chunks[1][0].flatten().tolist() == [11, 12, 13, 14]
     assert chunks[1][1].tolist() == [12, 13, 14, 15]
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+def test_vl_static_cp_route_reuses_cpu_physical_boundaries(monkeypatch, cp_size):
+    """Static CP has no cp_group: forward must reuse the producer's route."""
+    routes = pytest.importorskip("megatron.core.context_parallel_layout.routes")
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from relax.backends.megatron.data import _prebuild_vlm_static_cp_route
+
+    physical_offsets = [0, 32, 96, 160]
+    # Inaccessible tensor contents catch accidental reads of device boundaries.
+    # The CPU list includes per-document padding, not the valid token lengths.
+    cu_seqlens = torch.empty(len(physical_offsets), dtype=torch.int32, device="meta")
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens)
+    assert packed.cp_group is None
+    builder = routes.build_thd_cp_partition_route
+    calls = []
+
+    def build_from_cpu(offsets, size, rank, *, device):
+        assert offsets.device.type == "cpu"
+        assert offsets.tolist() == physical_offsets
+        calls.append((size, rank, device))
+        return builder(offsets, size, rank, device=device)
+
+    monkeypatch.setattr(routes, "build_thd_cp_partition_route", build_from_cpu)
+    _prebuild_vlm_static_cp_route(packed, physical_offsets, cp_size, cp_size - 1, torch.device("cpu"))
+    if cp_size == 1:
+        assert calls == []
+        assert packed.cp_partition_route is None
+        return
+
+    assert calls == [(cp_size, cp_size - 1, torch.device("cpu"))]
+    route = packed.cp_partition_route
+    assert route is not None
+    assert sum(route.zigzag_split_sizes) == sum(route.contiguous_split_sizes) == physical_offsets[-1] // cp_size
+
+    def fail_fallback(*_args, **_kwargs):
+        raise AssertionError("Forward must not rebuild the route or read device cu_seqlens")
+
+    monkeypatch.setattr(routes, "prebuild_thd_cp_partition_routes", fail_fallback)
+    monkeypatch.setattr(routes, "build_thd_cp_partition_route", fail_fallback)
+    for _ in range(3):
+        assert routes.get_thd_cp_partition_route(packed, "zigzag", "contiguous") is route
+        assert routes.get_thd_cp_partition_route(packed, "contiguous", "zigzag") is route

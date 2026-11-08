@@ -91,6 +91,30 @@ def test_streaming_tq_iterator_sampling_config_carries_window_quota(monkeypatch)
     assert "consumed_samples" not in config
 
 
+def test_streaming_tq_iterator_logging_does_not_materialize_advantages(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+    # Meta tensors reject scalar reads without requiring a GPU. Logging must
+    # preserve both populated and empty CP advantage slices without reading them.
+    advantages = [torch.empty(3, device="meta"), torch.empty(0, device="meta")]
+    tokens = [torch.tensor([1, 2, 3]), torch.tensor([4])]
+    batch = {"tokens": tokens, "advantages": advantages}
+    meta = types.SimpleNamespace(extra_info={"window_dispatched": 2})
+
+    def get_data(**kwargs):
+        return batch, meta
+
+    monkeypatch.setattr(stream_module, "get_data_from_transfer_queue", get_data)
+    iterator = _make_iterator(stream_module, get_data_fn=get_data, all_consumed_fn=lambda: False)
+
+    result, result_meta = next(iterator)
+
+    assert result is batch and result_meta is meta
+    assert result["tokens"] is tokens and result["advantages"] is advantages
+    assert result["__loss_scale__"] == 0.5
+    assert iterator._sample_count == 2
+    assert iterator.get_buffer()[0][0] is batch
+
+
 def test_get_data_from_transfer_queue_can_skip_per_rank_agreement(monkeypatch):
     stream_module = _load_stream_module(monkeypatch)
 
